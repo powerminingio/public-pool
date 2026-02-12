@@ -7,6 +7,7 @@ import * as zmq from 'zeromq';
 
 import { IBlockTemplate } from '../models/bitcoin-rpc/IBlockTemplate';
 import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
+import * as fs from 'node:fs';
 import * as PGPubsub from 'pg-pubsub';
 
 @Injectable()
@@ -34,10 +35,17 @@ export class BitcoinRpcService implements OnModuleInit {
 
 
         const url = this.configService.get('BITCOIN_RPC_URL');
-        const user = this.configService.get('BITCOIN_RPC_USER');
-        const pass = this.configService.get('BITCOIN_RPC_PASSWORD');
+        let user = this.configService.get('BITCOIN_RPC_USER');
+        let pass = this.configService.get('BITCOIN_RPC_PASSWORD');
         const port = parseInt(this.configService.get('BITCOIN_RPC_PORT'));
         const timeout = parseInt(this.configService.get('BITCOIN_RPC_TIMEOUT'));
+        const cookiefile = this.configService.get('BITCOIN_RPC_COOKIEFILE');
+
+        if (cookiefile != undefined && cookiefile != '') {
+            const cookie = fs.readFileSync(cookiefile).toString().split(':');
+            user = cookie[0];
+            pass = cookie[1];
+        }
 
         this.client = new RPCClient({ url, port, timeout, user, pass });
 
