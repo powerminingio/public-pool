@@ -40,7 +40,7 @@ export class MiningJob {
         //    32-byte - Commitment hash: Double-SHA256(witness root hash|witness reserved value)
 
         //    39th byte onwards: Optional data with no consensus meaning
-        const extra = Buffer.from('Public-Pool');
+        const extra = Buffer.from('pool.powermining.io');
 
         // Encode the block height
         // https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki
