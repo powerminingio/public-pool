@@ -84,7 +84,7 @@ export class AppController {
       uptime: this.uptime
     };
 
-    await this.cacheManager.set(CACHE_KEY, data, this.cacheTTL.siteInfo);
+    await this.cacheManager.set(CACHE_KEY, data, this.cacheTTL.siteInfo * 1000);
 
     return data;
 
@@ -115,7 +115,7 @@ export class AppController {
       fee: 0
     }
 
-    await this.cacheManager.set(CACHE_KEY, data, this.cacheTTL.poolInfo);
+    await this.cacheManager.set(CACHE_KEY, data, this.cacheTTL.poolInfo * 1000);
 
     return data;
   }
@@ -138,7 +138,7 @@ export class AppController {
 
     const chartData = await this.homeGraphService.getChartDataForSite();
 
-    await this.cacheManager.set(CACHE_KEY, chartData, this.cacheTTL.chart);
+    await this.cacheManager.set(CACHE_KEY, chartData, this.cacheTTL.chart * 1000);
 
     return chartData;
 
