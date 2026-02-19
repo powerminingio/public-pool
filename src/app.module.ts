@@ -1,6 +1,7 @@
 import { HttpModule } from '@nestjs/axios';
 import { CacheModule } from '@nestjs/cache-manager';
 import { Module } from '@nestjs/common';
+import { redisStore } from 'cache-manager-redis-yet';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -81,7 +82,15 @@ const ORMModules = [
             imports: [ConfigModule],
             inject: [ConfigService]
         }),
-        CacheModule.register(),
+        CacheModule.registerAsync({
+            isGlobal: true,
+            useFactory: async () => ({
+                store: await redisStore({
+                    url: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
+                }),
+                ttl: 300, // seconds
+            }),
+        }),
         ScheduleModule.forRoot(),
         HttpModule,
         ...ORMModules
