@@ -68,6 +68,22 @@ function toNum(x) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function dedupeHighScores(highScores) {
+  if (!Array.isArray(highScores)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const h of highScores) {
+    if (!h) continue;
+    const key = `${h.updatedAt ?? ""}|${h.bestDifficulty ?? ""}|${h.bestDifficultyUserAgent ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(h);
+  }
+  // Match backend intent: highest difficulty first (bestDifficulty is string in JSON)
+  out.sort((a, b) => toNum(b.bestDifficulty) - toNum(a.bestDifficulty));
+  return out;
+}
+
 /**
  * Merge /api/info payloads from multiple workers.
  *
@@ -85,11 +101,16 @@ function mergeInfoPayloads(payloads) {
     uptime: null,
   };
 
-  // blockData: usually empty in your output; just concat if present.
+  // blockData/highScores are DB-backed and identical across workers in normal operation.
+  // If we concat across workers we will create duplicates (e.g. 2 workers => every row twice).
   for (const p of payloads) {
     if (!p) continue;
-    if (Array.isArray(p.blockData)) out.blockData.push(...p.blockData);
-    if (Array.isArray(p.highScores)) out.highScores.push(...p.highScores);
+    if (out.blockData.length === 0 && Array.isArray(p.blockData) && p.blockData.length) {
+      out.blockData = p.blockData;
+    }
+    if (Array.isArray(p.highScores) && p.highScores.length) {
+      out.highScores.push(...p.highScores);
+    }
   }
 
   // uptime: pick earliest start (or just keep the first non-null)
@@ -129,9 +150,8 @@ function mergeInfoPayloads(payloads) {
       totalHashRate: String(x.totalHashRate),
     }));
 
-  // highScores: sort by updatedAt desc, keep top 50
-  out.highScores.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-  out.highScores = out.highScores.slice(0, 50);
+  // highScores: dedupe across workers, sort by difficulty desc, keep top 10
+  out.highScores = dedupeHighScores(out.highScores).slice(0, 10);
 
   return out;
 }
