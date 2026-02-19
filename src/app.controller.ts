@@ -11,11 +11,19 @@ import { ClientService } from './ORM/client/client.service';
 import { HomeGraphService } from './ORM/home-graph/home-graph.service';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
 import { UserAgentReportView } from './ORM/_views/user-agent-report/user-agent-report.view';
+import { ConfigService } from '@nestjs/config';
 
 @Controller()
 export class AppController {
 
   private uptime = new Date();
+
+  // Configurable cache TTLs (in seconds)
+  private readonly cacheTTL = {
+    siteInfo: parseInt(this.configService.get('API_CACHE_TTL_SITE_INFO') ?? '300'),
+    poolInfo: parseInt(this.configService.get('API_CACHE_TTL_POOL_INFO') ?? '600'),
+    chart: parseInt(this.configService.get('API_CACHE_TTL_CHART') ?? '10'), // Reduced to 10s for faster updates
+  };
 
   constructor(
     @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
@@ -25,7 +33,8 @@ export class AppController {
     private readonly bitcoinRpcService: BitcoinRpcService,
     private readonly homeGraphService: HomeGraphService,
     private readonly addressSettingsService: AddressSettingsService,
-    private readonly userAgentReportService: UserAgentReportService
+    private readonly userAgentReportService: UserAgentReportService,
+    private readonly configService: ConfigService,
   ) { }
 
   @Get('info')
@@ -75,8 +84,7 @@ export class AppController {
       uptime: this.uptime
     };
 
-    //5 min
-    await this.cacheManager.set(CACHE_KEY, data, 5 * 60 * 1000);
+    await this.cacheManager.set(CACHE_KEY, data, this.cacheTTL.siteInfo);
 
     return data;
 
@@ -107,8 +115,7 @@ export class AppController {
       fee: 0
     }
 
-    //5 min
-    await this.cacheManager.set(CACHE_KEY, data, 5 * 60 * 1000);
+    await this.cacheManager.set(CACHE_KEY, data, this.cacheTTL.poolInfo);
 
     return data;
   }
@@ -131,8 +138,7 @@ export class AppController {
 
     const chartData = await this.homeGraphService.getChartDataForSite();
 
-    //10 min
-    await this.cacheManager.set(CACHE_KEY, chartData, 10 * 60 * 1000);
+    await this.cacheManager.set(CACHE_KEY, chartData, this.cacheTTL.chart);
 
     return chartData;
 
