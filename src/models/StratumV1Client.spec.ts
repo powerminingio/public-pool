@@ -478,6 +478,28 @@ describe('StratumV1Client', () => {
         expect(force).toBe(true);
     });
 
+    it('should not decay difficulty below the client suggestion', async () => {
+        jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+
+        emitMessage(MockRecording1.MINING_SUBSCRIBE);
+        emitMessage(MockRecording1.MINING_SUGGEST_DIFFICULTY);
+        emitMessage(MockRecording1.MINING_AUTHORIZE);
+        await new Promise((r) => setTimeout(r, 100));
+
+        expect((client as any).sessionDifficulty).toBe(512);
+
+        // No shares for >5 minutes: idle decay retargets to 512/6 → 64. A
+        // bursty client (e.g. a proxy serving time-sliced rented hashrate) is
+        // quiet between bursts by design; its suggested difficulty must act as
+        // the session floor or repeated decay walks the session to MIN_DIFF.
+        jest.setSystemTime(new Date(Date.now() + 6 * 60 * 1000));
+        expect((client as any).statistics.getSuggestedDifficulty(512)).toBe(64);
+
+        await (client as any).checkDifficulty();
+
+        expect((client as any).sessionDifficulty).toBe(512);
+    });
+
     it('should save client', async () => {
         jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
 
