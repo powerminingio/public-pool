@@ -25,4 +25,23 @@ describe('SetPayoutMessage', () => {
         });
     });
 
+    describe('malformed messages', () => {
+
+        it('should not throw when params are missing entirely', () => {
+            const malformed = plainToInstance(
+                SetPayoutMessage,
+                JSON.parse('{"id": 8, "method": "mining.set_payout"}'),
+            );
+            expect(malformed.address).toBeUndefined();
+        });
+
+        it('should not throw when params is null', () => {
+            const malformed = plainToInstance(
+                SetPayoutMessage,
+                JSON.parse('{"id": 8, "method": "mining.set_payout", "params": null}'),
+            );
+            expect(malformed.address).toBeUndefined();
+        });
+    });
+
 });

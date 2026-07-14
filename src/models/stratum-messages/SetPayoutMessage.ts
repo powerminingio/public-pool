@@ -1,5 +1,5 @@
 import { Expose, Transform } from 'class-transformer';
-import { ArrayMinSize, IsArray, IsString } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsString } from 'class-validator';
 
 import { eRequestMethod } from '../enums/eRequestMethod';
 import { IsBitcoinAddress } from '../validators/bitcoin-address.validator';
@@ -14,12 +14,14 @@ export class SetPayoutMessage extends StratumBaseMessage {
 
     @IsArray()
     @ArrayMinSize(1)
+    @ArrayMaxSize(1)
+    @IsString({ each: true })
     params: string[];
 
     @Expose()
     @IsString()
     @Transform(({ value, key, obj, type }) => {
-        return obj.params[0];
+        return obj.params?.[0];
     })
     @IsBitcoinAddress()
     public address: string;
