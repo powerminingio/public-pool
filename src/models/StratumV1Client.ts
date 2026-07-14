@@ -885,10 +885,13 @@ export class StratumV1Client {
             }
             await this.ensureClientEntity();
             try {
+                // Share statistics are keyed to the job's payout address (not the
+                // authorized identity) so a set_payout switch credits each address
+                // with exactly the work mined for it.
                 await this.shareAccountingService?.recordAcceptedShare({
                     protocol: this.accountingProtocol,
                     payoutMode: this.payoutMode,
-                    address: this.clientAuthorization.address,
+                    address: minerAddress,
                     clientName: this.clientAuthorization.worker,
                     sessionId: this.extraNonceAndSessionId,
                     clientId: this.clientEntity.id,
