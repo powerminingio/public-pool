@@ -242,13 +242,22 @@ describe('ClientController', () => {
     });
 
     await expect(controller.getClientInfo('bc1qtest', 'pplns')).resolves.toMatchObject({
-      workersCount: 1,
+      workersCount: 2,
       workers: [
         {
           sessionId: 'active1',
           name: 'active-worker',
           payoutMode: 'pplns',
           hashRate: 1024,
+        },
+        // A zero-hashrate session that is alive (not deleted, recently updated)
+        // stays listed: bursty submitters (e.g. time-sliced proxy upstreams)
+        // legitimately persist hashRate = 0 between bursts.
+        {
+          sessionId: 'idle1',
+          name: 'idle-worker',
+          payoutMode: 'pplns',
+          hashRate: 0,
         },
       ],
     });
