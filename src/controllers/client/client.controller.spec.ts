@@ -252,7 +252,8 @@ describe('ClientController', () => {
         },
         // A zero-hashrate session that is alive (not deleted, recently updated)
         // stays listed: bursty submitters (e.g. time-sliced proxy upstreams)
-        // legitimately persist hashRate = 0 between bursts.
+        // remain at the default hashRate = 0 until a non-zero value is first
+        // persisted (zeros are never written).
         {
           sessionId: 'idle1',
           name: 'idle-worker',
