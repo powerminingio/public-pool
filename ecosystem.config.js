@@ -1,14 +1,15 @@
-const dockerLogConfig = {
-  out_file: '/dev/stdout',
-  error_file: '/dev/stderr',
+const pm2LogConfig = (name) => ({
+  out_file: `/home/pool/.pm2/logs/${name}-out.log`,
+  error_file: `/home/pool/.pm2/logs/${name}-error.log`,
   merge_logs: true,
-};
+  log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+});
 
 module.exports = {
     apps: [
       // API instance
       {
-        ...dockerLogConfig,
+        ...pm2LogConfig('api'),
         name: 'api',
         script: './dist/main.js',
         instances: parseInt(process.env.API_WORKERS || '4', 10),
@@ -23,7 +24,7 @@ module.exports = {
       },
       // Master instance
       {
-        ...dockerLogConfig,
+        ...pm2LogConfig('master'),
         name: 'master',
         script: './dist/main.js',
         instances: 1,
@@ -37,7 +38,7 @@ module.exports = {
       },
       // Worker instances
       {
-        ...dockerLogConfig,
+        ...pm2LogConfig('workers'),
         name: 'workers',
         script: './dist/main.js',
         instances: parseInt(process.env.STRATUM_WORKERS || '2', 10),
