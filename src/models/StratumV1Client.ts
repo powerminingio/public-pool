@@ -141,20 +141,23 @@ export class StratumV1Client {
         this.backgroundWork = [];
         this.miningSubmissionHashes.clear();
 
-        if (this.clientEntity?.id) {
-            const clientId = this.clientEntity.id;
-            await this.clientService.delete(clientId);
-        }
-
-        // Virtual worker presences live and die with the connection that
-        // maintains them, exactly like the connection's own row.
-        for (const pending of this.virtualWorkerEntities.values()) {
-            const entity = await pending.catch(() => null);
-            if (entity?.id) {
-                await this.clientService.delete(entity.id);
+        // The connection's own row and the virtual worker presences maintained
+        // via set_payout live and die with the connection. Soft-delete them in
+        // parallel, tolerating per-row failures: destroy() is awaited from the
+        // socket close handler, where a rejection would go unhandled — and a
+        // failed soft-delete only leaves a row to age out of the report window.
+        const virtualEntities = await Promise.all(
+            [...this.virtualWorkerEntities.values()].map((pending) => pending.catch(() => null))
+        );
+        this.virtualWorkerEntities.clear();
+        const rowIds = [this.clientEntity?.id, ...virtualEntities.map((entity) => entity?.id)]
+            .filter((id): id is string => id != null);
+        const deletions = await Promise.allSettled(rowIds.map((id) => this.clientService.delete(id)));
+        for (const deletion of deletions) {
+            if (deletion.status === 'rejected') {
+                console.warn(`Failed to soft-delete client row on disconnect: ${deletion.reason?.message ?? deletion.reason}`);
             }
         }
-        this.virtualWorkerEntities.clear();
     }
 
     private async handleSocketData(data: Buffer): Promise<void> {
