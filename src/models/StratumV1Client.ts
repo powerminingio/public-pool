@@ -158,9 +158,18 @@ export class StratumV1Client {
         this.backgroundWork = [];
         this.miningSubmissionHashes.clear();
 
-        if (this.clientEntity?.id) {
-            const clientId = this.clientEntity.id;
-            await this.clientService.delete(clientId);
+        // The rows describing this connection live and die with it. Soft-delete
+        // them in parallel, tolerating per-row failures: destroy() is awaited
+        // from the socket close handler, where a rejection would go unhandled —
+        // and a failed soft-delete only leaves a row to age out of the report
+        // window.
+        const rowIds = [this.clientEntity?.id]
+            .filter((id): id is string => id != null);
+        const deletions = await Promise.allSettled(rowIds.map((id) => this.clientService.delete(id)));
+        for (const deletion of deletions) {
+            if (deletion.status === 'rejected') {
+                console.warn(`Failed to soft-delete client row on disconnect: ${deletion.reason?.message ?? deletion.reason}`);
+            }
         }
     }
 
