@@ -25,6 +25,11 @@ export class MiningJob {
     public jobTemplateId: string;
     public networkDifficulty: number;
     public creation: number;
+    // The miner payout address this job's coinbase pays (last entry, after any
+    // prepended dev fee). Bound to the job so a submit — including a late
+    // in-flight one after a payout switch — attributes to the address the work
+    // was actually built for, not the connection's current authorization.
+    public payoutAddress: string;
 
     constructor(
         private network: bitcoinjs.networks.Network,
@@ -36,6 +41,7 @@ export class MiningJob {
         this.creation = new Date().getTime();
         this.jobTemplateId = jobTemplate.blockData.id;
         this.merkleBranchBuffers = jobTemplate.merkle_branch.map(branch => Buffer.from(branch, 'hex'));
+        this.payoutAddress = payoutInformation[payoutInformation.length - 1]?.address;
 
         this.coinbaseTransaction = this.createCoinbaseTransaction(payoutInformation, jobTemplate.blockData.coinbasevalue);
 

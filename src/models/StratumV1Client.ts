@@ -27,6 +27,7 @@ import { AddressObject, MiningJob } from './MiningJob';
 import { AuthorizationMessage } from './stratum-messages/AuthorizationMessage';
 import { ConfigurationMessage } from './stratum-messages/ConfigurationMessage';
 import { MiningSubmitMessage } from './stratum-messages/MiningSubmitMessage';
+import { SetPayoutMessage } from './stratum-messages/SetPayoutMessage';
 import { StratumErrorMessage } from './stratum-messages/StratumErrorMessage';
 import { SubscriptionMessage } from './stratum-messages/SubscriptionMessage';
 import { EXTRANONCE1_SIZE_BYTES } from './stratum.constants';
@@ -46,6 +47,12 @@ export class StratumV1Client {
     public clientSubscription: SubscriptionMessage;
     private clientConfiguration: ConfigurationMessage;
     private clientAuthorization: AuthorizationMessage;
+    // The address this connection's coinbase currently pays. Initialized to the
+    // authorized address; may be changed at runtime via mining.set_payout (the
+    // connection's extranonce1 stays stable). A connection that never sends
+    // set_payout keeps this equal to clientAuthorization.address — i.e. unchanged
+    // behaviour.
+    private currentPayoutAddress: string;
     private clientSuggestedDifficulty: SuggestDifficulty;
     private stratumSubscription: Subscription;
     private backgroundWork: NodeJS.Timeout[] = [];
@@ -274,6 +281,7 @@ export class StratumV1Client {
 
                 if (errors.length === 0) {
                     this.clientAuthorization = authorizationMessage;
+                    this.currentPayoutAddress = authorizationMessage.address;
                     if (this.clientSuggestedDifficulty == null && this.clientAuthorization.startingDiff != null && this.clientAuthorization.startingDiff > this.sessionDifficulty) {
                         this.sessionDifficulty = this.clientAuthorization.startingDiff;
                         this.sessionDifficultyTarget = DifficultyUtils.difficultyToTarget(this.sessionDifficulty);
@@ -386,6 +394,66 @@ export class StratumV1Client {
                 }
                 break;
             }
+            case eRequestMethod.SET_PAYOUT: {
+
+                const setPayoutMessage = plainToInstance(
+                    SetPayoutMessage,
+                    parsedMessage,
+                );
+
+                const validatorOptions: ValidatorOptions = {
+                    whitelist: true,
+                    //forbidNonWhitelisted: true,
+                };
+
+                const errors = await validate(setPayoutMessage, validatorOptions);
+
+                if (errors.length === 0) {
+                    this.currentPayoutAddress = setPayoutMessage.address;
+                    const success = await this.write(JSON.stringify(setPayoutMessage.response()) + '\n');
+                    if (!success) {
+                        return;
+                    }
+
+                    // If we're already serving work, push a fresh job paying the new
+                    // address immediately (stable extranonce1, new coinbase) so the
+                    // switch takes effect without waiting for the next template. Same
+                    // clean-jobs refresh pattern as checkDifficulty(); the new coinbase
+                    // guarantees the work is not byte-identical. Old jobs stay in the
+                    // jobs service (5 min) so a late in-flight submit for the previous
+                    // address still validates and is attributed correctly.
+                    if (this.stratumInitialized) {
+                        const jobTemplate = await firstValueFrom(this.stratumV1JobsService.newMiningJob$);
+                        const nextTimestamp = Math.max(
+                            jobTemplate.block.timestamp,
+                            Math.floor(Date.now() / 1000),
+                            (this.lastSentMiningJobTimestamp ?? 0) + 1
+                        );
+                        const refreshedJobTemplate: IJobTemplate = {
+                            ...jobTemplate,
+                            block: Object.assign(new bitcoinjs.Block(), jobTemplate.block, {
+                                timestamp: nextTimestamp
+                            }),
+                            blockData: { ...jobTemplate.blockData, clearJobs: true }
+                        };
+                        await this.sendNewMiningJob(refreshedJobTemplate);
+                    }
+                } else {
+                    console.error('Set payout validation error');
+                    const err = new StratumErrorMessage(
+                        setPayoutMessage.id,
+                        eStratumErrorCode.OtherUnknown,
+                        'Set payout validation error',
+                        errors).response();
+                    console.error(err);
+                    const success = await this.write(err);
+                    if (!success) {
+                        return;
+                    }
+                }
+
+                break;
+            }
             // default: {
             //     console.log("Invalid message");
             //     console.log(parsedMessage);
@@ -451,7 +519,7 @@ export class StratumV1Client {
     private async sendNewMiningJob(jobTemplate: IJobTemplate) {
         await this.ensureClientEntity();
 
-        let payoutInformation = this.getPayoutInformation(jobTemplate, this.clientAuthorization.address);
+        let payoutInformation = this.getPayoutInformation(jobTemplate, this.currentPayoutAddress ?? this.clientAuthorization.address);
         // const devFeeAddress = this.configService.get('DEV_FEE_ADDRESS');
         // //50Th/s
         // this.noFee = false;
@@ -608,6 +676,12 @@ export class StratumV1Client {
                 return false;
             }
 
+            // Attribute the share to the address the matched job's coinbase actually
+            // pays — which can differ from clientAuthorization.address after a
+            // mining.set_payout switch. Validated against the stored job above, so
+            // this is exact for in-flight work.
+            const minerAddress = job.payoutAddress ?? this.clientAuthorization.address;
+
             let blockSubmissionResult: string = null;
             const isBlockCandidate = DifficultyUtils.meetsTarget(
                 hashBuffer,
@@ -627,7 +701,7 @@ export class StratumV1Client {
                 blockSubmissionResult = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
                 await this.blocksService.save({
                     height: jobTemplate.blockData.height,
-                    minerAddress: this.clientAuthorization.address,
+                    minerAddress: minerAddress,
                     worker: this.clientAuthorization.worker,
                     sessionId: this.extraNonceAndSessionId,
                     blockData: blockHex,
@@ -646,7 +720,7 @@ export class StratumV1Client {
                     });
                 }
 
-                await this.notificationService.notifySubscribersBlockFound(this.clientAuthorization.address, jobTemplate.blockData.height, updatedJobBlock, blockSubmissionResult);
+                await this.notificationService.notifySubscribersBlockFound(minerAddress, jobTemplate.blockData.height, updatedJobBlock, blockSubmissionResult);
                 //success
                 if (this.isSuccessfulBlockSubmission(blockSubmissionResult)) {
                     await this.addressSettingsService.resetBestDifficultyAndShares();
@@ -654,10 +728,13 @@ export class StratumV1Client {
             }
             await this.ensureClientEntity();
             try {
+                // Share statistics are keyed to the job's payout address (not the
+                // authorized identity) so a set_payout switch credits each address
+                // with exactly the work mined for it.
                 await this.shareAccountingService?.recordAcceptedShare({
                     protocol: this.accountingProtocol,
                     payoutMode: this.payoutMode,
-                    address: this.clientAuthorization.address,
+                    address: minerAddress,
                     clientName: this.clientAuthorization.worker,
                     sessionId: this.extraNonceAndSessionId,
                     clientId: this.clientEntity.id,
@@ -689,7 +766,7 @@ export class StratumV1Client {
             if (submissionDifficulty > this.clientEntity.bestDifficulty) {
                 await this.clientService.updateBestDifficultyIfHigher(this.clientEntity.id, submissionDifficulty);
                 this.clientEntity.bestDifficulty = submissionDifficulty;
-                await this.addressSettingsService.updateBestDifficultyIfHigher(this.clientAuthorization.address, submissionDifficulty, this.clientEntity.userAgent);
+                await this.addressSettingsService.updateBestDifficultyIfHigher(minerAddress, submissionDifficulty, this.clientEntity.userAgent);
             }
 
 
