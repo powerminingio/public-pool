@@ -30,18 +30,26 @@ export class MiningJob {
     // in-flight one after a payout switch — attributes to the address the work
     // was actually built for, not the connection's current authorization.
     public payoutAddress: string;
+    // The worker label of the payout identity this job was built for (from the
+    // optional second mining.set_payout param, else the connection's authorized
+    // worker). Bound to the job for the same reason as payoutAddress: a late
+    // in-flight submit after a payout switch must be recorded under the worker
+    // the work was built for, not whichever identity is current at submit time.
+    public payoutWorker?: string;
 
     constructor(
         private network: bitcoinjs.networks.Network,
         public jobId: string,
         payoutInformation: AddressObject[],
-        jobTemplate: IJobTemplate
+        jobTemplate: IJobTemplate,
+        payoutWorker?: string
     ) {
 
         this.creation = new Date().getTime();
         this.jobTemplateId = jobTemplate.blockData.id;
         this.merkleBranchBuffers = jobTemplate.merkle_branch.map(branch => Buffer.from(branch, 'hex'));
         this.payoutAddress = payoutInformation[payoutInformation.length - 1]?.address;
+        this.payoutWorker = payoutWorker;
 
         this.coinbaseTransaction = this.createCoinbaseTransaction(payoutInformation, jobTemplate.blockData.coinbasevalue);
 

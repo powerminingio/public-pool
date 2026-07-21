@@ -63,6 +63,14 @@ export class ClientService {
         return await this.clientRepository.update({ id }, { hashRate, updatedAt, deletedAt: null });
     }
 
+    // Refresh a row's liveness (updatedAt window + un-soft-delete) without
+    // touching its hashRate. Used for virtual worker presences maintained by
+    // mining.set_payout, which have no per-connection hashrate of their own —
+    // their displayed rate comes from share accounting.
+    public async heartbeat(id: string, updatedAt = new Date()) {
+        return await this.clientRepository.update({ id }, { updatedAt, deletedAt: null });
+    }
+
     public async connectedClientCount(): Promise<number> {
         return await this.clientRepository.count();
     }

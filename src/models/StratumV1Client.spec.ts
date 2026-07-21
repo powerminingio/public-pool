@@ -82,6 +82,7 @@ describe('StratumV1Client', () => {
             connectedClientCount: jest.fn(async () => clients.size),
             updateBestDifficultyIfHigher: jest.fn().mockResolvedValue({ affected: 1 }),
             updateHashRate: jest.fn().mockResolvedValue(undefined),
+            heartbeat: jest.fn().mockResolvedValue(undefined),
         } as any;
 
         configService = {
@@ -789,6 +790,137 @@ describe('StratumV1Client', () => {
             expect(recorded.length).toBe(2);
             expect(recorded.filter(r => r.address === AUTHORIZED_ADDRESS && r.jobId === jobBefore).length).toBe(1);
             expect(recorded.filter(r => r.address === NEW_PAYOUT_ADDRESS && r.jobId === jobAfter).length).toBe(1);
+        });
+
+        it('should record shares under the job\'s worker param across a switch', async () => {
+            const written: string[] = [];
+            jest.spyOn(client as any, 'write').mockImplementation((data: string) => { written.push(data); return Promise.resolve(true); });
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const jobBefore = lastNotifyParams(written)[0];
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const jobAfter = lastNotifyParams(written)[0];
+            expect(jobAfter).not.toEqual(jobBefore);
+
+            jest.useRealTimers();
+
+            // in-flight share on the pre-switch job: recorded under the worker the
+            // job was built for (the authorized worker), not the current identity
+            emitMessage(MockRecording1.MINING_SUBMIT);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            // share on the post-switch job: recorded under the set_payout worker
+            emitMessage(`{"id": 8, "method": "mining.submit", "params": ["${AUTHORIZED_ADDRESS}.bitaxe3", "${jobAfter}", "c708000000000001", "${MockRecording1.TIME}", "ed460d91", "00002000"]}`);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            const recorded = shareAccountingService.recordAcceptedShare.mock.calls.map(call => call[0]);
+            expect(recorded.length).toBe(2);
+            expect(recorded.filter(r => r.jobId === jobBefore && r.clientName === 'bitaxe3' && r.address === AUTHORIZED_ADDRESS).length).toBe(1);
+            expect(recorded.filter(r => r.jobId === jobAfter && r.clientName === 'o32' && r.address === NEW_PAYOUT_ADDRESS).length).toBe(1);
+        });
+
+        it('should fall back to the authorized worker when set_payout omits the worker param', async () => {
+            const written: string[] = [];
+            jest.spyOn(client as any, 'write').mockImplementation((data: string) => { written.push(data); return Promise.resolve(true); });
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            const jobAfter = lastNotifyParams(written)[0];
+
+            jest.useRealTimers();
+            emitMessage(`{"id": 8, "method": "mining.submit", "params": ["${AUTHORIZED_ADDRESS}.bitaxe3", "${jobAfter}", "c708000000000001", "${MockRecording1.TIME}", "ed460d91", "00002000"]}`);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            const recorded = shareAccountingService.recordAcceptedShare.mock.calls.map(call => call[0]);
+            expect(recorded.length).toBe(1);
+            expect(recorded[0].address).toBe(NEW_PAYOUT_ADDRESS);
+            expect(recorded[0].clientName).toBe('bitaxe3');
+        });
+
+        it('should maintain a virtual worker presence per (address, worker)', async () => {
+            jest.spyOn(client as any, 'write').mockImplementation(() => Promise.resolve(true));
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const insertMock = clientService.insert as jest.Mock;
+            const insertsAfterAuthorize = insertMock.mock.calls.length; // the connection's own row
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            // one virtual row inserted for the new identity
+            expect(insertMock.mock.calls.length).toBe(insertsAfterAuthorize + 1);
+            expect(insertMock).toHaveBeenLastCalledWith(expect.objectContaining({
+                address: NEW_PAYOUT_ADDRESS,
+                clientName: 'o32',
+                sessionId: expect.any(String),
+                bestDifficulty: 0,
+            }));
+            const virtualEntity = await insertMock.mock.results[insertMock.mock.results.length - 1].value;
+
+            // a repeat switch to the same identity refreshes the row, no new insert
+            emitMessage(`{"id": 9, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            expect(insertMock.mock.calls.length).toBe(insertsAfterAuthorize + 1);
+            expect((clientService as any).heartbeat).toHaveBeenCalledWith(virtualEntity.id);
+
+            // switching back to the authorized identity needs no virtual row
+            emitMessage(`{"id": 10, "method": "mining.set_payout", "params": ["${AUTHORIZED_ADDRESS}", "bitaxe3"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            expect(insertMock.mock.calls.length).toBe(insertsAfterAuthorize + 1);
+
+            // the virtual presence dies with the connection
+            await client.destroy();
+            expect(clientService.delete).toHaveBeenCalledWith(virtualEntity.id);
+        });
+
+        it('should key share accounting and best difficulty to the virtual identity row', async () => {
+            const written: string[] = [];
+            jest.spyOn(client as any, 'write').mockImplementation((data: string) => { written.push(data); return Promise.resolve(true); });
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            const jobAfter = lastNotifyParams(written)[0];
+
+            const insertMock = clientService.insert as jest.Mock;
+            const virtualEntity = await insertMock.mock.results[insertMock.mock.results.length - 1].value;
+            expect(virtualEntity.clientName).toBe('o32');
+
+            jest.useRealTimers();
+            emitMessage(`{"id": 8, "method": "mining.submit", "params": ["${AUTHORIZED_ADDRESS}.bitaxe3", "${jobAfter}", "c708000000000001", "${MockRecording1.TIME}", "ed460d91", "00002000"]}`);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            // the share is keyed to the virtual identity's row, so per-worker
+            // session summaries aggregate per payout identity
+            const recorded = shareAccountingService.recordAcceptedShare.mock.calls.map(call => call[0]);
+            expect(recorded.length).toBe(1);
+            expect(recorded[0].clientId).toBe(virtualEntity.id);
+            expect(recorded[0].sessionId).toBe(MockRecording1.EXTRA_NONCE);
+
+            // best difficulty ratchets on the virtual row and the payout address
+            const bestCalls = (clientService.updateBestDifficultyIfHigher as jest.Mock).mock.calls;
+            expect(bestCalls.some(call => call[0] === virtualEntity.id)).toBe(true);
+            const addressBestCalls = (addressSettings.updateBestDifficultyIfHigher as jest.Mock).mock.calls;
+            expect(addressBestCalls.some(call => call[0] === NEW_PAYOUT_ADDRESS)).toBe(true);
         });
 
     });
