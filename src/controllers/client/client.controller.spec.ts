@@ -133,6 +133,80 @@ describe('ClientController', () => {
     }
   });
 
+  it('should zero a stale session hashRate instead of serving the frozen estimate', async () => {
+    const now = Date.now();
+    clientService.getByAddress.mockResolvedValue([
+      {
+        id: 'f1e2d3c4-0000-4000-8000-000000000001',
+        sessionId: '6fab2a1f',
+        clientName: 'o46',
+        bestDifficulty: 100,
+        // Entity hashRate is written share-event-side: this is the last
+        // in-burst estimate, frozen since the burst ended.
+        hashRate: 2_800_000_000_000,
+        startTime: new Date(now - 3 * 60 * 60 * 1000).toISOString(),
+        // updatedAt stays fresh without shares (keeps the worker listed) —
+        // it is NOT a share-recency signal.
+        updatedAt: new Date(now - 2 * 60 * 1000).toISOString(),
+        address: 'bc1qtest',
+        payoutMode: 'solo',
+      },
+    ]);
+    addressSettingsService.getSettings.mockResolvedValue(null);
+    shareAccountingService.getAddressSummary.mockResolvedValue({
+      totalAcceptedShares: 10,
+      totalCreditedDifficulty: 100,
+      bestSubmissionDifficulty: 0,
+    });
+    const lastShareAt = new Date(now - 56 * 60 * 1000).toISOString();
+    shareAccountingService.getSessionSummaries.mockResolvedValue(new Map([
+      ['f1e2d3c4-0000-4000-8000-000000000001', {
+        bestSubmissionDifficulty: 16_500_000,
+        latestShareAt: lastShareAt,
+        hashRateLast10Minutes: null,
+      }],
+    ]));
+
+    const response = await controller.getClientInfo('bc1qtest');
+    expect(response.workers).toHaveLength(1);
+    expect(response.workers[0].hashRate).toBe(0);
+    expect(response.workers[0].lastSeen).toBe(lastShareAt);
+  });
+
+  it('should keep serving the entity hashRate while the session is share-fresh', async () => {
+    const now = Date.now();
+    clientService.getByAddress.mockResolvedValue([
+      {
+        id: 'f1e2d3c4-0000-4000-8000-000000000002',
+        sessionId: 'abcd1234',
+        clientName: 'o80',
+        bestDifficulty: 100,
+        hashRate: 1_200_000_000_000,
+        startTime: new Date(now - 60 * 60 * 1000).toISOString(),
+        updatedAt: new Date(now - 60 * 1000).toISOString(),
+        address: 'bc1qtest',
+        payoutMode: 'solo',
+      },
+    ]);
+    addressSettingsService.getSettings.mockResolvedValue(null);
+    shareAccountingService.getAddressSummary.mockResolvedValue({
+      totalAcceptedShares: 10,
+      totalCreditedDifficulty: 100,
+      bestSubmissionDifficulty: 0,
+    });
+    shareAccountingService.getSessionSummaries.mockResolvedValue(new Map([
+      ['f1e2d3c4-0000-4000-8000-000000000002', {
+        bestSubmissionDifficulty: 500,
+        latestShareAt: new Date(now - 2 * 60 * 1000).toISOString(),
+        hashRateLast10Minutes: null,
+      }],
+    ]));
+
+    const response = await controller.getClientInfo('bc1qtest');
+    expect(response.workers).toHaveLength(1);
+    expect(response.workers[0].hashRate).toBe(1_200_000_000_000);
+  });
+
   it('should expose the latest current PPLNS expected payout for an address', async () => {
     addressSettingsService.getSettings.mockResolvedValue(null);
     shareAccountingService.getAddressSummary.mockResolvedValue({
