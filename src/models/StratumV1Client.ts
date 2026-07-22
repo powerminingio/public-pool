@@ -315,10 +315,6 @@ export class StratumV1Client {
                 break;
             }
             case eRequestMethod.SUGGEST_DIFFICULTY: {
-                if (this.usedSuggestedDifficulty == true) {
-                    return;
-                }
-
                 const suggestDifficultyMessage = plainToInstance(
                     SuggestDifficulty,
                     parsedMessage
@@ -330,6 +326,44 @@ export class StratumV1Client {
                 };
 
                 const errors = await validate(suggestDifficultyMessage, validatorOptions);
+
+                if (this.usedSuggestedDifficulty == true) {
+                    // Mid-session re-suggest: raise-only floor update. A proxy
+                    // re-sizes its suggestion live (it tracks the backing
+                    // supply's vardiff); dropping repeats pins the session at
+                    // its handshake-time gate, and a client that only submits
+                    // shares above its own (higher) difficulty then gets each
+                    // credited at the stale gate — under-reading its hashrate
+                    // for the rest of the session (observed −66% over 12h on a
+                    // pinned proxy upstream, 2026-07-22). Raising the stored
+                    // suggestion lets checkDifficulty()'s floor path emit the
+                    // set_difficulty + refreshed job; lowering still requires
+                    // a reconnect, so a client can only ratchet its own
+                    // difficulty up — no new abuse surface.
+                    if (errors.length === 0
+                        && suggestDifficultyMessage.suggestedDifficulty
+                            > (this.clientSuggestedDifficulty?.suggestedDifficulty ?? 0)) {
+                        this.clientSuggestedDifficulty = suggestDifficultyMessage;
+                        const raised = this.clampDifficulty(suggestDifficultyMessage.suggestedDifficulty);
+                        if (this.stratumInitialized) {
+                            // Vardiff may already sit above the new suggestion;
+                            // the session only moves up, never down here.
+                            if (raised > this.sessionDifficulty) {
+                                await this.applySessionDifficulty(raised);
+                            }
+                        } else {
+                            // Repeat suggest inside the handshake: apply like
+                            // the first (initStratum has not sent anything yet).
+                            this.sessionDifficulty = raised;
+                            this.sessionDifficultyTarget = DifficultyUtils.difficultyToTarget(this.sessionDifficulty);
+                            const success = await this.write(JSON.stringify(this.clientSuggestedDifficulty.response(this.sessionDifficulty)) + '\n');
+                            if (!success) {
+                                return;
+                            }
+                        }
+                    }
+                    return;
+                }
 
                 if (errors.length === 0) {
 
@@ -922,36 +956,42 @@ export class StratumV1Client {
 
         if (targetDiff != this.sessionDifficulty) {
             //console.log(`Adjusting ${this.extraNonceAndSessionId} difficulty from ${this.sessionDifficulty} to ${targetDiff}`);
-            this.sessionDifficulty = targetDiff;
-            this.sessionDifficultyTarget = DifficultyUtils.difficultyToTarget(this.sessionDifficulty);
-
-            const data = JSON.stringify({
-                id: null,
-                method: eResponseMethod.SET_DIFFICULTY,
-                params: [targetDiff]
-            }) + '\n';
-
-
-            await this.socket.write(data);
-
-            const jobTemplate = await this.getLatestPayoutJobTemplate();
-            const nextTimestamp = Math.max(
-                jobTemplate.block.timestamp,
-                Math.floor(Date.now() / 1000),
-                (this.lastSentMiningJobTimestamp ?? 0) + 1
-            );
-            // We need to clear jobs so the difficulty takes effect, but avoid mutating or
-            // re-sending the shared cached template with byte-identical work.
-            const refreshedJobTemplate: IJobTemplate = {
-                ...jobTemplate,
-                block: Object.assign(new bitcoinjs.Block(), jobTemplate.block, {
-                    timestamp: nextTimestamp
-                }),
-                blockData: { ...jobTemplate.blockData, clearJobs: true }
-            };
-            this.broadcastMiningJob(refreshedJobTemplate, true);
-
+            await this.applySessionDifficulty(targetDiff);
         }
+    }
+
+    /// Set a new session difficulty on the wire: set_difficulty followed by a
+    /// clean-jobs template refresh so the change takes effect immediately
+    /// without invalidating in-flight work against the shared cached template.
+    private async applySessionDifficulty(targetDiff: number) {
+        this.sessionDifficulty = targetDiff;
+        this.sessionDifficultyTarget = DifficultyUtils.difficultyToTarget(this.sessionDifficulty);
+
+        const data = JSON.stringify({
+            id: null,
+            method: eResponseMethod.SET_DIFFICULTY,
+            params: [targetDiff]
+        }) + '\n';
+
+
+        await this.socket.write(data);
+
+        const jobTemplate = await this.getLatestPayoutJobTemplate();
+        const nextTimestamp = Math.max(
+            jobTemplate.block.timestamp,
+            Math.floor(Date.now() / 1000),
+            (this.lastSentMiningJobTimestamp ?? 0) + 1
+        );
+        // We need to clear jobs so the difficulty takes effect, but avoid mutating or
+        // re-sending the shared cached template with byte-identical work.
+        const refreshedJobTemplate: IJobTemplate = {
+            ...jobTemplate,
+            block: Object.assign(new bitcoinjs.Block(), jobTemplate.block, {
+                timestamp: nextTimestamp
+            }),
+            blockData: { ...jobTemplate.blockData, clearJobs: true }
+        };
+        this.broadcastMiningJob(refreshedJobTemplate, true);
     }
 
     private calculateDifficulty(header: Buffer): { submissionDifficulty: number, submissionHash: string, hashBuffer: Buffer } {
