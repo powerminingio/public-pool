@@ -959,9 +959,11 @@ export class StratumV1Client {
         }
     }
 
-    /// Set a new session difficulty on the wire: set_difficulty followed by a
-    /// clean-jobs template refresh so the change takes effect immediately
-    /// without invalidating in-flight work against the shared cached template.
+    /**
+     * Set a new session difficulty on the wire: set_difficulty followed by a
+     * clean-jobs template refresh so the change takes effect immediately
+     * without invalidating in-flight work against the shared cached template.
+     */
     private async applySessionDifficulty(targetDiff: number) {
         this.sessionDifficulty = targetDiff;
         this.sessionDifficultyTarget = DifficultyUtils.difficultyToTarget(this.sessionDifficulty);
@@ -973,7 +975,10 @@ export class StratumV1Client {
         }) + '\n';
 
 
-        await this.socket.write(data);
+        const success = await this.write(data);
+        if (!success) {
+            return;
+        }
 
         const jobTemplate = await this.getLatestPayoutJobTemplate();
         const nextTimestamp = Math.max(
