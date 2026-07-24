@@ -372,6 +372,52 @@ describe('StratumV1Client', () => {
         expect((client as any).sessionDifficulty).toBe(512);
     });
 
+    it('should raise the session difficulty and floor on a mid-session re-suggest', async () => {
+        jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+
+        emitMessage(MockRecording1.MINING_SUBSCRIBE);
+        emitMessage(MockRecording1.MINING_SUGGEST_DIFFICULTY);
+        emitMessage(MockRecording1.MINING_AUTHORIZE);
+        await new Promise((r) => setTimeout(r, 100));
+        expect((client as any).sessionDifficulty).toBe(512);
+
+        // A proxy re-sizes its suggestion live (e.g. the backing supply's
+        // vardiff bound is only discovered after its boot handshake). The
+        // repeat must raise the session — dropping it pins the crediting gate
+        // at the handshake-time value for the whole session.
+        emitMessage(`{"id": 5, "method": "mining.suggest_difficulty", "params": [100000]}`);
+        await new Promise((r) => setTimeout(r, 100));
+
+        expect((client as any).sessionDifficulty).toBe(100000);
+
+        // The raised suggestion is also the new idle-decay floor.
+        jest.setSystemTime(new Date(Date.now() + 6 * 60 * 1000));
+        await (client as any).checkDifficulty();
+        expect((client as any).sessionDifficulty).toBe(100000);
+    });
+
+    it('should ignore a lower mid-session re-suggest', async () => {
+        jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+
+        emitMessage(MockRecording1.MINING_SUBSCRIBE);
+        emitMessage(MockRecording1.MINING_SUGGEST_DIFFICULTY);
+        emitMessage(MockRecording1.MINING_AUTHORIZE);
+        await new Promise((r) => setTimeout(r, 100));
+        expect((client as any).sessionDifficulty).toBe(512);
+
+        // Raise-only: a lower repeat neither drops the session difficulty…
+        emitMessage(`{"id": 5, "method": "mining.suggest_difficulty", "params": [8]}`);
+        await new Promise((r) => setTimeout(r, 100));
+        expect((client as any).sessionDifficulty).toBe(512);
+
+        // …nor weakens the decay floor.
+        jest.setSystemTime(new Date(Date.now() + 6 * 60 * 1000));
+        await (client as any).checkDifficulty();
+        expect((client as any).sessionDifficulty).toBe(512);
+    });
+
     it('should save client', async () => {
         jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
 
