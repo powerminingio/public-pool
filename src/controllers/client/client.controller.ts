@@ -57,13 +57,18 @@ export class ClientController {
                         Number(sessionSummary?.bestSubmissionDifficulty ?? 0),
                     );
                     const lastSeen = sessionSummary?.latestShareAt ?? worker.lastSeen;
+                    // The accounting window normalizes to 0 when empty (never
+                    // null), so "no usable rate" is any non-positive value —
+                    // only a positive window rate beats the entity fallback.
+                    const accountingHashRate = Number(sessionSummary?.hashRateLast10Minutes ?? 0);
                     return {
                         sessionId: worker.sessionId,
                         name: worker.clientName,
                         payoutMode: worker.payoutMode,
                         bestDifficulty: bestDifficulty.toFixed(2),
-                        hashRate: sessionSummary?.hashRateLast10Minutes
-                            ?? this.freshHashRate(worker.hashRate, lastSeen),
+                        hashRate: Number.isFinite(accountingHashRate) && accountingHashRate > 0
+                            ? accountingHashRate
+                            : this.freshHashRate(worker.hashRate, lastSeen),
                         startTime: worker.startTime,
                         lastSeen
                     };
@@ -175,24 +180,28 @@ export class ClientController {
         };
     }
 
-    /// The stored entity hashRate is computed share-event-side (persisted at
-    /// share arrival), so between shares nothing updates it: an idle session
-    /// otherwise serves its last in-burst estimate forever (observed live: a
-    /// time-sliced proxy upstream reading 2.8 TH/s an hour after its last
-    /// share; always-on miners never expose this because shares keep it
-    /// fresh). Serve it only while the session's last share is inside the
-    /// window it substitutes for; report 0 once older — "Last Seen" already
-    /// tells the rest of the story.
-    /// NOTE — to consider for upstream: public-pool master has the same
-    /// artifact through a different path (getHashRateForSession divides the
-    /// newest stat buckets without checking their age against now), so the
-    /// same age clamp applies there.
+    /**
+     * The stored entity hashRate is computed share-event-side (persisted at
+     * share arrival), so between shares nothing updates it: an idle session
+     * otherwise serves its last in-burst estimate forever (observed live: a
+     * time-sliced proxy upstream reading 2.8 TH/s an hour after its last
+     * share; always-on miners never expose this because shares keep it
+     * fresh). Serve it only while the session's last share is inside the
+     * window it substitutes for; report 0 once older — "Last Seen" already
+     * tells the rest of the story.
+     *
+     * NOTE — to consider for upstream: public-pool master has the same
+     * artifact through a different path (getHashRateForSession divides the
+     * newest stat buckets without checking their age against now), so the
+     * same age clamp applies there.
+     */
     private freshHashRate(hashRate: unknown, lastSeen: unknown): number {
         const lastSeenMs = lastSeen == null ? NaN : new Date(lastSeen as string | number | Date).getTime();
         if (!Number.isFinite(lastSeenMs) || Date.now() - lastSeenMs > STALE_HASHRATE_WINDOW_MS) {
             return 0;
         }
-        return Number(hashRate ?? 0);
+        const rate = Number(hashRate ?? 0);
+        return Number.isFinite(rate) ? rate : 0;
     }
 
     private getRequestedPayoutMode(payoutMode?: string): PayoutMode | undefined {

@@ -163,7 +163,7 @@ describe('ClientController', () => {
       ['f1e2d3c4-0000-4000-8000-000000000001', {
         bestSubmissionDifficulty: 16_500_000,
         latestShareAt: lastShareAt,
-        hashRateLast10Minutes: null,
+        hashRateLast10Minutes: 0,
       }],
     ]));
 
@@ -198,7 +198,7 @@ describe('ClientController', () => {
       ['f1e2d3c4-0000-4000-8000-000000000002', {
         bestSubmissionDifficulty: 500,
         latestShareAt: new Date(now - 2 * 60 * 1000).toISOString(),
-        hashRateLast10Minutes: null,
+        hashRateLast10Minutes: 0,
       }],
     ]));
 
