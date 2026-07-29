@@ -49,6 +49,7 @@ export interface ShareAccountingSummary {
     networkDifficultyPercent: number;
     blockCandidateCount: number;
     latestShareAt: string | null;
+    oldestShareAt: string | null;
     protocolBreakdown: {
         protocol: string;
         acceptedShares: number;
@@ -493,6 +494,7 @@ export class ShareAccountingService implements OnModuleInit, OnModuleDestroy {
             networkDifficultyPercent: 0,
             blockCandidateCount: 0,
             latestShareAt: null,
+            oldestShareAt: null,
             protocolBreakdown: [],
         };
     }
@@ -653,7 +655,8 @@ export class ShareAccountingService implements OnModuleInit, OnModuleDestroy {
                 COALESCE(SUM("shares") FILTER (WHERE "bucket" > "latestCompletedBucket" - INTERVAL '1 day' AND "bucket" <= "latestCompletedBucket"), 0)::float AS "creditedDifficultyLastDay",
                 COALESCE((SUM("shares") FILTER (WHERE "bucket" = "latestCompletedBucket") * ${HASHES_PER_DIFFICULTY}) / ${ROLLUP_BUCKET_SECONDS}, 0)::float AS "hashRateLast10Minutes",
                 COALESCE((SUM("shares") FILTER (WHERE "bucket" > "latestCompletedBucket" - INTERVAL '1 hour' AND "bucket" <= "latestCompletedBucket") * ${HASHES_PER_DIFFICULTY}) / 3600, 0)::float AS "hashRateLastHour",
-                MAX("bucket") AS "latestShareAt"
+                MAX("bucket") AS "latestShareAt",
+                MIN("bucket") AS "oldestShareAt"
             FROM filtered_rows
         `, params);
 
@@ -678,6 +681,13 @@ export class ShareAccountingService implements OnModuleInit, OnModuleDestroy {
             latestShareAt: summary?.latestShareAt == null
                 ? null
                 : new Date(summary.latestShareAt).toISOString(),
+            // The oldest retained share bucket for the filter — a durable
+            // "observed since" anchor that survives reconnects, unlike a
+            // session's startTime. Clamped by rollup retention, which only
+            // matters if retention ever drops below the UI's 24h window.
+            oldestShareAt: summary?.oldestShareAt == null
+                ? null
+                : new Date(summary.oldestShareAt).toISOString(),
             protocolBreakdown: [],
         };
     }
