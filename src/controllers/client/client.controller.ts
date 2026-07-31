@@ -217,7 +217,12 @@ export class ClientController {
         return workers
             .filter(worker => payoutMode == null || worker.payoutMode === payoutMode)
             .filter(worker => worker.deletedAt == null)
-            .filter(worker => Number(worker.hashRate ?? 0) > 0)
+            // No hashRate > 0 filter: a session's hashRate is computed only once
+            // its share cache spans >60s, and zero/negative values are never
+            // persisted — so a bursty (e.g. time-sliced proxy) or freshly
+            // connected worker sits at the default 0 while genuinely mining.
+            // Liveness is the soft-delete + updatedAt window; display falls
+            // back to share-accounting rates.
             .filter(worker => {
                 const updatedAt = worker.updatedAt == null ? 0 : new Date(worker.updatedAt).getTime();
                 return Number.isFinite(updatedAt) && updatedAt > activeSince;

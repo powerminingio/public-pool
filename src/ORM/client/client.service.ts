@@ -99,7 +99,6 @@ export class ClientService {
             .where('client.address = :address', { address })
             .andWhere('client.deletedAt IS NULL')
             .andWhere('client.updatedAt > :activeSince', { activeSince })
-            .andWhere('client.hashRate > 0')
             .orderBy('client.updatedAt', 'DESC')
             .getMany();
     }
