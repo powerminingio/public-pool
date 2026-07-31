@@ -114,6 +114,7 @@ export class StratumV1Client {
     // Keyed address\0worker; the map holds the insert promise so a submit racing
     // the row creation awaits the same row instead of duplicating it.
     private virtualWorkerEntities = new Map<string, Promise<ClientEntity>>();
+    private virtualWorkerCapWarned = false;
 
     public extraNonceAndSessionId: string;
     public sessionStart: Date;
@@ -807,6 +808,19 @@ export class StratumV1Client {
         const key = this.virtualWorkerKey(address, worker);
         const existing = this.virtualWorkerEntities.get(key);
         if (existing == null) {
+            // Bound the presence table like every other per-connection identity
+            // structure. Beyond the cap new identities keep mining and
+            // attributing correctly (servedJobWorkers / share accounting are
+            // independent of this row) — they just don't get a workers-list
+            // presence row, instead of this map and the client table growing
+            // without end on a connection looping fresh (address, worker) pairs.
+            if (this.virtualWorkerEntities.size >= SERVED_PAYOUT_IDENTITY_MAX_ENTRIES) {
+                if (!this.virtualWorkerCapWarned) {
+                    this.virtualWorkerCapWarned = true;
+                    console.warn(`Virtual worker presence cap (${SERVED_PAYOUT_IDENTITY_MAX_ENTRIES}) reached for ${this.extraNonceAndSessionId}; further set_payout identities will not be listed as workers`);
+                }
+                return Promise.resolve();
+            }
             const inserting = this.clientService.insert({
                 sessionId: this.getRandomHexString(),
                 address,
@@ -1435,8 +1449,11 @@ export class StratumV1Client {
             ?? this.clientAuthorization.address;
     }
 
+    // Serve-time only (jobs are never served before authorization), so the
+    // authorized fallback is always present — no optional chaining that would
+    // let an undefined slip into servedJobWorkers.
     private getCurrentPayoutWorker(): string {
-        return this.currentPayoutWorker ?? this.clientAuthorization?.worker;
+        return this.currentPayoutWorker ?? this.clientAuthorization.worker;
     }
 
     /**
