@@ -1,4 +1,12 @@
-const { availableParallelism, cpus } = require('os');
+const { availableParallelism, cpus, homedir } = require('os');
+const { join } = require('path');
+
+const pm2LogConfig = (name) => ({
+  out_file: join(homedir(), '.pm2', 'logs', `${name}-out.log`),
+  error_file: join(homedir(), '.pm2', 'logs', `${name}-error.log`),
+  merge_logs: true,
+  log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+});
 
 const dockerLogConfig = {
   out_file: '/dev/stdout',
@@ -32,7 +40,7 @@ module.exports = {
   apps: [
     // API instance
     {
-      ...dockerLogConfig,
+      ...pm2LogConfig('api'),
       name: 'api',
       script: './dist/main.js',
       instances: apiWorkers,
@@ -48,7 +56,7 @@ module.exports = {
     // Minimal authoritative template/notifier instance. This entrypoint avoids
     // initializing API, Stratum, reporting, and notification integrations.
     {
-      ...dockerLogConfig,
+      ...pm2LogConfig('master'),
       name: 'master',
       script: './dist/notifier-main.js',
       instances: 1,
@@ -62,7 +70,7 @@ module.exports = {
     },
     // Non-hot-path master duties: notifications, reporting, and cleanup.
     {
-      ...dockerLogConfig,
+      ...pm2LogConfig('maintenance'),
       name: 'maintenance',
       script: './dist/maintenance-main.js',
       instances: 1,
@@ -76,7 +84,7 @@ module.exports = {
     },
     // Worker instances
     {
-      ...dockerLogConfig,
+      ...pm2LogConfig('workers'),
       name: 'workers',
       script: './dist/main.js',
       instances: stratumWorkers,
