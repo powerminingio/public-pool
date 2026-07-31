@@ -1214,6 +1214,33 @@ describe('StratumV1Client', () => {
             expect(response).toContain('"result":null');
         });
 
+        it('should reject set_payout on a non-solo connection without touching the payout or jobs', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            // The handshake above ran in the default solo mode so the harness
+            // serves jobs; the guard itself only reads payoutMode at dispatch.
+            (client as any).payoutMode = 'pplns';
+            const payoutBefore = (client as any).currentPayoutAddress;
+            const writesBefore = written.length;
+
+            emitMessage(`{"id": 11, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            expect(socket.end).not.toHaveBeenCalled();
+            const response = written.find(m => m.includes('"id":11'));
+            expect(response).toBeDefined();
+            expect(response).toContain('"result":null');
+            expect(response).toContain('only available on solo');
+            // no ack, no payout switch, no clean-jobs refresh
+            expect(written.slice(writesBefore)).not.toContain('{"id":11,"error":null,"result":true}\n');
+            expect((client as any).currentPayoutAddress).toBe(payoutBefore);
+            expect(written.slice(writesBefore).some(m => m.includes('"mining.notify"'))).toBe(false);
+        });
+
         it('should attribute shares to the job\'s payout address across a switch', async () => {
             const written = captureWrites();
 
