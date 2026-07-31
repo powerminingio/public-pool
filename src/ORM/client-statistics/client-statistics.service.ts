@@ -6,6 +6,7 @@ import { normalizePayoutMode, PayoutMode } from '../../types/payout-mode';
 
 const HASHES_PER_DIFFICULTY = 4294967296;
 const CHART_BUCKET_SECONDS = 600;
+const CHART_BUCKET_MS = CHART_BUCKET_SECONDS * 1000;
 const CHART_WINDOW = '24 hours';
 const SITE_CHART_WINDOW = '7 days';
 
@@ -132,7 +133,7 @@ export class ClientStatisticsService {
 
         const result = await this.dataSource.query(query, params);
 
-        return result.map(res => {
+        const points = result.map(res => {
             return {
                 label: new Date(res.label).toISOString(),
                 data: res.data,
@@ -140,6 +141,13 @@ export class ClientStatisticsService {
                 acceptedCount: Number(res.acceptedCount ?? 0),
             };
         });
+
+        return this.fillBucketGaps(points, label => ({
+            label,
+            data: '0',
+            shares: 0,
+            acceptedCount: 0,
+        }));
     }
 
     private async getAcceptedShareChartDataByPayoutMode(
@@ -180,7 +188,7 @@ export class ClientStatisticsService {
 
         const result = await this.dataSource.query(query, params);
 
-        return result.map(res => {
+        const points = result.map(res => {
             return {
                 label: new Date(res.label).toISOString(),
                 payoutMode: res.payoutMode,
@@ -189,6 +197,60 @@ export class ClientStatisticsService {
                 acceptedCount: Number(res.acceptedCount ?? 0),
             };
         });
+
+        const byMode = new Map<string, typeof points>();
+        for (const point of points) {
+            const series = byMode.get(point.payoutMode) ?? [];
+            series.push(point);
+            byMode.set(point.payoutMode, series);
+        }
+
+        const filled = [...byMode.entries()].flatMap(([payoutMode, series]) =>
+            this.fillBucketGaps(series, label => ({
+                label,
+                payoutMode,
+                data: '0',
+                shares: 0,
+                acceptedCount: 0,
+            })),
+        );
+
+        return filled.sort((a, b) => a.label === b.label
+            ? String(a.payoutMode).localeCompare(String(b.payoutMode))
+            : a.label.localeCompare(b.label));
+    }
+
+    // The 10m rollup only has rows for buckets that received shares, so a chart
+    // drawn from the raw result line-bridges outages and burst gaps as if work
+    // never stopped. Fill interior and trailing gaps with explicit zero points;
+    // never fill before a series' first bucket in the window (a session that
+    // connected two hours ago must not render a day of leading zeros). The
+    // current in-progress bucket stays excluded, mirroring the SQL bound.
+    private fillBucketGaps<T extends { label: string }>(rows: T[], makeZeroPoint: (label: string) => T): T[] {
+        if (rows.length === 0) {
+            return rows;
+        }
+
+        const fillUntilMs = Math.floor(Date.now() / CHART_BUCKET_MS) * CHART_BUCKET_MS;
+        const filled: T[] = [];
+        let expectedMs = new Date(rows[0].label).getTime();
+
+        for (const row of rows) {
+            const rowMs = new Date(row.label).getTime();
+            while (expectedMs < rowMs) {
+                filled.push(makeZeroPoint(new Date(expectedMs).toISOString()));
+                expectedMs += CHART_BUCKET_MS;
+            }
+            filled.push(row);
+            expectedMs = rowMs + CHART_BUCKET_MS;
+        }
+
+        while (expectedMs < fillUntilMs) {
+            filled.push(makeZeroPoint(new Date(expectedMs).toISOString()));
+            expectedMs += CHART_BUCKET_MS;
+        }
+
+        return filled;
     }
 
     private buildModeChartWhere(filter: AcceptedShareChartFilter): { whereSql: string; params: string[] } {
