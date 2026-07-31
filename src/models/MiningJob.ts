@@ -83,7 +83,7 @@ export class MiningJob {
         //    32-byte - Commitment hash: Double-SHA256(witness root hash|witness reserved value)
 
         //    39th byte onwards: Optional data with no consensus meaning
-        const extra = Buffer.from('Public-Pool');
+        const extra = Buffer.from('pool.powermining.io');
 
         // BIP34 uses Bitcoin Script's minimally encoded integer push. Heights
         // 1..16 are OP_1..OP_16, not a one-byte PUSHDATA operation. Keeping the
