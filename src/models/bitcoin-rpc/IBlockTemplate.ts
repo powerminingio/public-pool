@@ -1,3 +1,5 @@
+import type { PayoutMode } from '../../types/payout-mode';
+
 export interface IBlockTemplateTx {
     data: string; //'hex',                 // (string) transaction data encoded in hexadecimal (byte-for-byte)
     txid: string; //'hex',                 // (string) transaction id encoded in little-endian hexadecimal
@@ -44,5 +46,25 @@ export interface IBlockTemplate {
     capabilities: string[]
     payoutSnapshotId?: string;
     payoutOutputs?: IBlockTemplatePayoutOutput[];
+    /** Force miners to switch even when the previous block hash is unchanged. */
+    forceCleanJobs?: boolean;
+    /** Distinguishes normal fee-paying templates from the subsidy-only bridge. */
+    jobType?: 'full' | 'empty';
+    /** Limits this template to the payout path whose coinbase data is ready. */
+    payoutMode?: PayoutMode | 'all';
+    /** Correlates master detection, Redis delivery, and socket fan-out traces. */
+    notificationEventId?: string;
+    /** Wall-clock time when the master first observed the source block notification. */
+    sourceNotificationReceivedAtMs?: number;
+    /** Wall-clock time when the compact job finished construction on the master. */
+    notificationPreparedAtMs?: number;
+    /** Wall-clock time immediately before the Redis publish command was issued. */
+    notificationPublishedAtMs?: number;
+    /** Worker-local wall-clock time when the urgent Redis subscriber received the bridge. */
+    notificationWorkerReceivedAtMs?: number;
+    /** Worker-local wall-clock time immediately before the bridge entered job preparation. */
+    notificationWorkerHandledAtMs?: number;
+    /** Timestamp of the rolling PPLNS snapshot seed used by an empty bridge. */
+    payoutBridgeSeedCreatedAtMs?: number;
 
 }

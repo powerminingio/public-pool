@@ -2,6 +2,7 @@ import { AddressType, getAddressInfo } from 'bitcoin-address-validation';
 import * as bitcoinjs from 'bitcoinjs-lib';
 
 import { IJobTemplate } from '../services/stratum-v1-jobs.service';
+import { PayoutMode } from '../types/payout-mode';
 import { hash256 } from '../utils/hash.utils';
 import { eResponseMethod } from './enums/eResponseMethod';
 import { IMiningNotify } from './stratum-messages/IMiningNotify';
@@ -13,7 +14,35 @@ export interface AddressObject {
     percent?: number;
     amountSats?: number;
 }
+
+export interface MiningJobOwnership {
+    payoutMode: PayoutMode;
+    payoutIdentity: string;
+}
+
+export interface MiningNotifyHeaderFields {
+    previousBlockHash: string;
+    version: string;
+    bits: string;
+    timestamp: string;
+    cleanJobs: boolean;
+}
+
+interface PreStagedNotifyLayout {
+    fields: MiningNotifyHeaderFields;
+    offsets: {
+        previousBlockHash: number;
+        version: number;
+        bits: number;
+        timestamp: number;
+    };
+}
+
 export class MiningJob {
+
+    private static readonly paymentScriptCache = new Map<string, Buffer>();
+    private static readonly paymentScriptCacheMaxEntries = 250_000;
+    private static readonly placeholderPrevHash = Buffer.alloc(32, 0);
 
     private coinbaseTransaction: bitcoinjs.Transaction;
     private coinbasePart1: string;
@@ -21,8 +50,12 @@ export class MiningJob {
     private coinbasePart1Buffer: Buffer;
     private coinbasePart2Buffer: Buffer;
     private merkleBranchBuffers: Buffer[];
+    private miningNotifyResponse: string;
+    private miningNotifyResponseBuffer: Buffer;
+    private preStagedNotifyLayout: PreStagedNotifyLayout;
 
     public jobTemplateId: string;
+    public tipKey: string;
     public networkDifficulty: number;
     public creation: number;
     // The miner payout address this job's coinbase pays (last entry, after any
@@ -43,10 +76,13 @@ export class MiningJob {
         payoutInformation: AddressObject[],
         jobTemplate: IJobTemplate,
         payoutWorker?: string
+        public readonly ownership?: MiningJobOwnership,
     ) {
 
         this.creation = new Date().getTime();
         this.jobTemplateId = jobTemplate.blockData.id;
+        this.tipKey = jobTemplate.blockData.tipKey;
+        this.networkDifficulty = jobTemplate.blockData.networkDifficulty;
         this.merkleBranchBuffers = jobTemplate.merkle_branch.map(branch => Buffer.from(branch, 'hex'));
         this.payoutAddress = payoutInformation[payoutInformation.length - 1]?.address;
         this.payoutWorker = payoutWorker;
@@ -63,18 +99,15 @@ export class MiningJob {
         //    39th byte onwards: Optional data with no consensus meaning
         const extra = Buffer.from('pool.powermining.io');
 
-        // Encode the block height
-        // https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki
-        const blockHeightEncoded = bitcoinjs.script.number.encode(jobTemplate.blockData.height);
+        // BIP34 uses Bitcoin Script's minimally encoded integer push. Heights
+        // 1..16 are OP_1..OP_16, not a one-byte PUSHDATA operation. Keeping the
+        // extranonce padding independent of the height width also prevents a
+        // future four-byte height from consuming part of the pool tag.
+        const blockHeightPrefix = this.encodeCoinbaseHeight(jobTemplate.blockData.height);
+        const padding = Buffer.alloc(TOTAL_EXTRANONCE_SIZE_BYTES, 0);
 
-        // Get the length of the block height encoding
-        const blockHeightLengthByte = Buffer.from([blockHeightEncoded.length]);
-
-        // generate padding and take length of encode blockHeight into account
-        const padding = Buffer.alloc(TOTAL_EXTRANONCE_SIZE_BYTES + (3 - blockHeightEncoded.length), 0)
-
-        // build the script
-        this.coinbaseTransaction.ins[0].script = Buffer.concat([blockHeightLengthByte, blockHeightEncoded, extra, padding])
+        // Build the script with the extranonce placeholder at the very end.
+        this.coinbaseTransaction.ins[0].script = Buffer.concat([blockHeightPrefix, extra, padding]);
 
         this.coinbaseTransaction.addOutput(bitcoinjs.script.compile([bitcoinjs.opcodes.OP_RETURN, Buffer.concat([segwitMagicBits, jobTemplate.block.witnessCommit])]), 0);
 
@@ -106,22 +139,115 @@ export class MiningJob {
         return Buffer.from(this.coinbasePart2Buffer);
     }
 
-    public buildHeaderBuffer(jobTemplate: IJobTemplate, versionMask: number, nonce: number, extraNonce: string, extraNonce2: string, timestamp: number): Buffer {
+    /**
+     * Promote a coinbase that was built during the prior height to the
+     * authoritative empty template. The coinbase bytes are height/payout bound;
+     * header fields and submission ownership are replaced only at activation.
+     */
+    public activatePreStagedTemplate(
+        jobTemplate: IJobTemplate,
+        headerFields = MiningJob.createNotifyHeaderFields(jobTemplate),
+    ): void {
+        this.jobTemplateId = jobTemplate.blockData.id;
+        this.tipKey = jobTemplate.blockData.tipKey;
+        this.networkDifficulty = jobTemplate.blockData.networkDifficulty;
+        this.creation = Date.now();
+        if (!this.patchPreStagedNotify(headerFields)) {
+            this.miningNotifyResponseBuffer = null;
+        }
+        this.miningNotifyResponse = null;
+        this.preStagedNotifyLayout = null;
+    }
+
+    /**
+     * Serialize the miner-specific notify while the prior height is active.
+     * Activation can then overwrite the fixed-width header fields in place,
+     * avoiding JSON serialization and Buffer allocation in the new-tip loop.
+     */
+    public preparePreStagedNotify(
+        jobTemplate: IJobTemplate,
+        headerFields = MiningJob.createNotifyHeaderFields(jobTemplate),
+    ): void {
+        if (!jobTemplate.block.prevHash.equals(MiningJob.placeholderPrevHash)) {
+            throw new Error('Pre-staged notify requires a placeholder prevhash');
+        }
+        this.responseBuffer(jobTemplate, headerFields);
+        const response = this.miningNotifyResponse;
+        let cursor = response.indexOf(`"${this.jobId}"`);
+        const locate = (value: string): number => {
+            const offset = response.indexOf(`"${value}"`, cursor);
+            if (offset < 0) {
+                throw new Error('Unable to locate pre-staged notify field');
+            }
+            cursor = offset + value.length + 2;
+            return offset + 1;
+        };
+        this.preStagedNotifyLayout = {
+            fields: { ...headerFields },
+            offsets: {
+                previousBlockHash: locate(headerFields.previousBlockHash),
+                version: locate(headerFields.version),
+                bits: locate(headerFields.bits),
+                timestamp: locate(headerFields.timestamp),
+            },
+        };
+    }
+
+    public buildCoinbaseMerkleRoot(extraNonce: string, extraNonce2: string): Buffer {
         const coinbaseBuffer = Buffer.concat([
             this.coinbasePart1Buffer,
             Buffer.from(`${extraNonce}${extraNonce2}`, 'hex'),
             this.coinbasePart2Buffer,
         ]);
-        const coinbaseHash = hash256(coinbaseBuffer);
-        const merkleRoot = this.calculateMerkleRootHash(coinbaseHash, this.merkleBranchBuffers);
+        return MiningJob.calculateMerkleRootFromCoinbaseHash(
+            hash256(coinbaseBuffer),
+            this.merkleBranchBuffers,
+        );
+    }
 
-        let version = jobTemplate.block.version;
-        if (versionMask !== undefined && versionMask != 0) {
-            version = version ^ versionMask;
+    public static calculateMerkleRootFromCoinbaseHash(
+        coinbaseHash: Buffer,
+        merkleBranches: readonly Buffer[],
+    ): Buffer {
+        let merkleRoot = coinbaseHash;
+        const bothMerkles = Buffer.alloc(64);
+        for (const merkleBranch of merkleBranches) {
+            bothMerkles.set(merkleRoot, 0);
+            bothMerkles.set(merkleBranch, 32);
+            merkleRoot = hash256(bothMerkles);
         }
+        return merkleRoot;
+    }
+
+    public static applyVersionRolling(jobVersion: number, versionBits: number, mask: number): number {
+        const unsignedJobVersion = jobVersion >>> 0;
+        const unsignedVersionBits = versionBits >>> 0;
+        const unsignedMask = mask >>> 0;
+        return (
+            (unsignedJobVersion & (~unsignedMask >>> 0))
+            | (unsignedVersionBits & unsignedMask)
+        ) >>> 0;
+    }
+
+    public buildHeaderBuffer(
+        jobTemplate: IJobTemplate,
+        versionBits: number,
+        nonce: number,
+        extraNonce: string,
+        extraNonce2: string,
+        timestamp: number,
+        versionRollingMask?: number,
+    ): Buffer {
+        const merkleRoot = this.buildCoinbaseMerkleRoot(extraNonce, extraNonce2);
+
+        const version = versionRollingMask == null
+            // SV2 standard-channel reconstruction passes an XOR delta because
+            // its submit message contains the complete version field.
+            ? (jobTemplate.block.version ^ versionBits) >>> 0
+            : MiningJob.applyVersionRolling(jobTemplate.block.version, versionBits, versionRollingMask);
 
         const header = Buffer.alloc(80);
-        header.writeInt32LE(version, 0);
+        header.writeUInt32LE(version, 0);
         jobTemplate.block.prevHash.copy(header, 4);
         merkleRoot.copy(header, 36);
         header.writeUInt32LE(timestamp, 68);
@@ -131,21 +257,40 @@ export class MiningJob {
         return header;
     }
 
-    public copyAndUpdateBlock(jobTemplate: IJobTemplate, versionMask: number, nonce: number, extraNonce: string, extraNonce2: string, timestamp: number): bitcoinjs.Block {
+    public copyAndUpdateBlock(
+        jobTemplate: IJobTemplate,
+        versionBits: number,
+        nonce: number,
+        extraNonce: string,
+        extraNonce2: string,
+        timestamp: number,
+        versionRollingMask?: number,
+    ): bitcoinjs.Block {
 
         const testBlock = Object.assign(new bitcoinjs.Block(), jobTemplate.block);
-        testBlock.transactions = jobTemplate.block.transactions.map(tx => {
-            return Object.assign(new bitcoinjs.Transaction(), tx);
-        });
-
-        testBlock.transactions[0] = this.cloneCoinbaseTransaction();
+        const rawTransactions = jobTemplate.blockData.transactions;
+        testBlock.transactions = [
+            this.cloneCoinbaseTransaction(),
+            ...(rawTransactions == null
+                ? jobTemplate.block.transactions.slice(1).map(tx =>
+                    Object.assign(new bitcoinjs.Transaction(), tx))
+                : rawTransactions.map((rawTransaction, index) => {
+                    const transaction = bitcoinjs.Transaction.fromHex(rawTransaction.data);
+                    if (transaction.getId().toLowerCase() !== rawTransaction.txid.toLowerCase()) {
+                        throw new Error(`transactions[${index}] data does not match its txid`);
+                    }
+                    return transaction;
+                })),
+        ];
 
         testBlock.nonce = nonce;
 
-        // recompute version mask
-        if (versionMask !== undefined && versionMask != 0) {
-            testBlock.version = (testBlock.version ^ versionMask);
-        }
+        const version = versionRollingMask == null
+            ? (testBlock.version ^ versionBits) >>> 0
+            : MiningJob.applyVersionRolling(testBlock.version, versionBits, versionRollingMask);
+        // bitcoinjs-lib serializes Block.version as a signed int32, while the
+        // protocol and bit-mask arithmetic use the corresponding uint32 bits.
+        testBlock.version = version | 0;
 
         // set the nonces
         const nonceScript = testBlock.transactions[0].ins[0].script.toString('hex');
@@ -153,28 +298,15 @@ export class MiningJob {
         testBlock.transactions[0].ins[0].script = Buffer.from(`${nonceScript.substring(0, nonceScript.length - (TOTAL_EXTRANONCE_SIZE_BYTES * 2))}${extraNonce}${extraNonce2}`, 'hex');
 
         //recompute the root since we updated the coinbase script with the nonces
-        testBlock.merkleRoot = this.calculateMerkleRootHash(testBlock.transactions[0].getHash(false), this.merkleBranchBuffers);
+        testBlock.merkleRoot = MiningJob.calculateMerkleRootFromCoinbaseHash(
+            testBlock.transactions[0].getHash(false),
+            this.merkleBranchBuffers,
+        );
 
 
         testBlock.timestamp = timestamp;
 
         return testBlock;
-    }
-
-
-    private calculateMerkleRootHash(newRoot: Buffer, merkleBranches: Buffer[]): Buffer {
-
-        const bothMerkles = Buffer.alloc(64);
-
-        bothMerkles.set(newRoot);
-
-        for (let i = 0; i < merkleBranches.length; i++) {
-            bothMerkles.set(merkleBranches[i], 32);
-            newRoot = hash256(bothMerkles);
-            bothMerkles.set(newRoot);
-        }
-
-        return bothMerkles.subarray(0, 32)
     }
 
 
@@ -210,53 +342,150 @@ export class MiningJob {
         return coinbaseTransaction;
     }
 
-    private getPaymentScript(address: string): Buffer {
-        const addressInfo = getAddressInfo(address);
-        switch (addressInfo.type) {
-            case AddressType.p2wpkh: {
-                return bitcoinjs.payments.p2wpkh({ address, network: this.network }).output;
-            }
-            case AddressType.p2pkh: {
-                return bitcoinjs.payments.p2pkh({ address, network: this.network }).output;
-            }
-            case AddressType.p2sh: {
-                return bitcoinjs.payments.p2sh({ address, network: this.network }).output;
-            }
-            case AddressType.p2tr: {
-                return bitcoinjs.payments.p2tr({ address, network: this.network }).output;
-            }
-            case AddressType.p2wsh: {
-                return bitcoinjs.payments.p2wsh({ address, network: this.network }).output;
-            }
-            default: {
-                return Buffer.alloc(0);
-            }
+    private encodeCoinbaseHeight(height: number): Buffer {
+        if (!Number.isSafeInteger(height) || height < 0) {
+            throw new Error('Coinbase height must be a non-negative safe integer');
         }
+        if (height === 0) {
+            return Buffer.from([bitcoinjs.opcodes.OP_0]);
+        }
+        if (height <= 16) {
+            return Buffer.from([bitcoinjs.opcodes.OP_1 + height - 1]);
+        }
+
+        const encoded = bitcoinjs.script.number.encode(height);
+        if (encoded.length >= bitcoinjs.opcodes.OP_PUSHDATA1) {
+            throw new Error('Coinbase height encoding is unexpectedly large');
+        }
+        return Buffer.concat([Buffer.from([encoded.length]), encoded]);
     }
 
-    public response(jobTemplate: IJobTemplate): string {
+    private getPaymentScript(address: string): Buffer {
+        const cacheKey = `${this.network.bech32}:${this.network.pubKeyHash}:${this.network.scriptHash}:${address}`;
+        const cached = MiningJob.paymentScriptCache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        const addressInfo = getAddressInfo(address);
+        let paymentScript: Buffer;
+        switch (addressInfo.type) {
+            case AddressType.p2wpkh: {
+                paymentScript = bitcoinjs.payments.p2wpkh({ address, network: this.network }).output;
+                break;
+            }
+            case AddressType.p2pkh: {
+                paymentScript = bitcoinjs.payments.p2pkh({ address, network: this.network }).output;
+                break;
+            }
+            case AddressType.p2sh: {
+                paymentScript = bitcoinjs.payments.p2sh({ address, network: this.network }).output;
+                break;
+            }
+            case AddressType.p2tr: {
+                paymentScript = bitcoinjs.payments.p2tr({ address, network: this.network }).output;
+                break;
+            }
+            case AddressType.p2wsh: {
+                paymentScript = bitcoinjs.payments.p2wsh({ address, network: this.network }).output;
+                break;
+            }
+            default: {
+                paymentScript = Buffer.alloc(0);
+                break;
+            }
+        }
+
+        MiningJob.paymentScriptCache.set(cacheKey, paymentScript);
+        if (MiningJob.paymentScriptCache.size > MiningJob.paymentScriptCacheMaxEntries) {
+            const oldest = MiningJob.paymentScriptCache.keys().next().value;
+            if (oldest != null) {
+                MiningJob.paymentScriptCache.delete(oldest);
+            }
+        }
+        return paymentScript;
+    }
+
+    public response(
+        jobTemplate: IJobTemplate,
+        headerFields = MiningJob.createNotifyHeaderFields(jobTemplate),
+    ): string {
+
+        if (this.miningNotifyResponse != null) {
+            return this.miningNotifyResponse;
+        }
+        if (this.miningNotifyResponseBuffer != null) {
+            this.miningNotifyResponse = this.miningNotifyResponseBuffer.toString();
+            return this.miningNotifyResponse;
+        }
 
         const job: IMiningNotify = {
             id: null,
             method: eResponseMethod.MINING_NOTIFY,
             params: [
                 this.jobId,
-                this.swapEndianWords(jobTemplate.block.prevHash).toString('hex'),
+                headerFields.previousBlockHash,
                 this.coinbasePart1,
                 this.coinbasePart2,
                 jobTemplate.merkle_branch,
-                jobTemplate.block.version.toString(16),
-                jobTemplate.block.bits.toString(16),
-                jobTemplate.block.timestamp.toString(16),
-                jobTemplate.blockData.clearJobs
+                headerFields.version,
+                headerFields.bits,
+                headerFields.timestamp,
+                headerFields.cleanJobs
             ]
         };
 
-        return JSON.stringify(job) + '\n';
+        this.miningNotifyResponse = JSON.stringify(job) + '\n';
+        this.miningNotifyResponseBuffer = Buffer.from(this.miningNotifyResponse);
+        return this.miningNotifyResponse;
+    }
+
+    public responseBuffer(
+        jobTemplate: IJobTemplate,
+        headerFields = MiningJob.createNotifyHeaderFields(jobTemplate),
+    ): Buffer {
+        if (this.miningNotifyResponseBuffer == null) {
+            this.response(jobTemplate, headerFields);
+        }
+        return this.miningNotifyResponseBuffer;
+    }
+
+    public static createNotifyHeaderFields(jobTemplate: IJobTemplate): MiningNotifyHeaderFields {
+        return {
+            previousBlockHash: MiningJob.swapEndianWords(jobTemplate.block.prevHash).toString('hex'),
+            version: jobTemplate.block.version.toString(16),
+            bits: jobTemplate.block.bits.toString(16),
+            timestamp: jobTemplate.block.timestamp.toString(16),
+            cleanJobs: jobTemplate.blockData.clearJobs,
+        };
+    }
+
+    private patchPreStagedNotify(headerFields: MiningNotifyHeaderFields): boolean {
+        const layout = this.preStagedNotifyLayout;
+        const response = this.miningNotifyResponseBuffer;
+        if (layout == null
+            || response == null
+            || layout.fields.cleanJobs !== headerFields.cleanJobs) {
+            return false;
+        }
+        const fields = [
+            ['previousBlockHash', headerFields.previousBlockHash],
+            ['version', headerFields.version],
+            ['bits', headerFields.bits],
+            ['timestamp', headerFields.timestamp],
+        ] as const;
+        if (fields.some(([name, value]) =>
+            value.length !== layout.fields[name].length)) {
+            return false;
+        }
+        for (const [name, value] of fields) {
+            response.write(value, layout.offsets[name], value.length, 'ascii');
+        }
+        return true;
     }
 
 
-    private swapEndianWords(buffer: Buffer): Buffer {
+    private static swapEndianWords(buffer: Buffer): Buffer {
         const swappedBuffer = Buffer.alloc(buffer.length);
 
         for (let i = 0; i < buffer.length; i += 4) {

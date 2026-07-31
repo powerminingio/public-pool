@@ -1,7 +1,8 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'net';
 import { monitorEventLoopDelay } from 'perf_hooks';
+import { Subscription } from 'rxjs';
 
 import { StratumV1Client } from '../models/StratumV1Client';
 import { StratumV2Client } from '../models/StratumV2Client';
@@ -14,6 +15,7 @@ import { ShareAccountingService } from '../ORM/share-accounting/share-accounting
 import { BitcoinRpcService } from './bitcoin-rpc.service';
 import { NotificationService } from './notification.service';
 import { RedisMessagingService } from './redis-messaging.service';
+import { Sv1PrestageActivation } from './redis-messaging.service';
 import { StratumV1JobsService } from './stratum-v1-jobs.service';
 import { StratumV2Service } from './stratum-v2.service';
 import { parsePayoutModePorts, PayoutMode } from '../types/payout-mode';
@@ -40,11 +42,13 @@ const DEFAULT_MAX_CONNECTIONS_PER_LISTENER = 10000;
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 10000;
 const DEFAULT_SOCKET_TIMEOUT_MS = 1000 * 60 * 60;
 const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY_MS = 1000 * 60;
+const DEFAULT_PRESTAGE_BATCH_SIZE = 500;
+const DEFAULT_FANOUT_TARGET_CLIENTS_PER_WORKER = 10000;
 
 
 
 @Injectable()
-export class StratumV1Service implements OnModuleInit {
+export class StratumV1Service implements OnModuleInit, OnModuleDestroy {
 
     private socketTimeout = 0;
     private emptySocket = 0;
@@ -54,6 +58,13 @@ export class StratumV1Service implements OnModuleInit {
     private readonly eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
     private backpressureMonitor: NodeJS.Timeout | null = null;
     private healthyBackpressureChecks = 0;
+    private readonly clients = new Set<StratumV1Client>();
+    private jobBroadcastSubscription: Subscription | null = null;
+    private jobActivationSubscription: Subscription | null = null;
+    private jobPrestageSubscription: Subscription | null = null;
+    private readonly pendingPrestageJobs = new Map<PayoutMode, import('./stratum-v1-jobs.service').IJobTemplate>();
+    private prestageDrainRunning = false;
+    private prestageGeneration = 0;
 
     constructor(
         private readonly bitcoinRpcService: BitcoinRpcService,
@@ -86,6 +97,23 @@ export class StratumV1Service implements OnModuleInit {
             return;
         }
 
+        this.jobActivationSubscription = this.bitcoinRpcService
+            .newSv1PrestageActivation$?.subscribe({
+                next: activation => this.activateAndBroadcastPrestage(activation),
+                error: error => console.error(`SV1 prestage activation subscription failed: ${error.message}`),
+            }) ?? null;
+        this.jobBroadcastSubscription = (
+            this.stratumV1JobsService.sv1MiningJob$
+            ?? this.stratumV1JobsService.newMiningJob$
+        ).subscribe({
+            next: jobTemplate => this.broadcastMiningJob(jobTemplate),
+            error: error => console.error(`SV1 job broadcast subscription failed: ${error.message}`),
+        });
+        this.jobPrestageSubscription = this.stratumV1JobsService.sv1PrestageJob$?.subscribe({
+            next: jobTemplate => this.queuePrestageMiningJob(jobTemplate),
+            error: error => console.error(`SV1 job prestage subscription failed: ${error.message}`),
+        }) ?? null;
+
         // wait for all the other processes to init for an even connection distribution 
         setTimeout(() => {
             parsePayoutModePorts(
@@ -116,6 +144,21 @@ export class StratumV1Service implements OnModuleInit {
 
     }
 
+    public onModuleDestroy(): void {
+        this.jobBroadcastSubscription?.unsubscribe();
+        this.jobBroadcastSubscription = null;
+        this.jobActivationSubscription?.unsubscribe();
+        this.jobActivationSubscription = null;
+        this.jobPrestageSubscription?.unsubscribe();
+        this.jobPrestageSubscription = null;
+        this.prestageGeneration++;
+        this.pendingPrestageJobs.clear();
+        if (this.backpressureMonitor != null) {
+            clearInterval(this.backpressureMonitor);
+            this.backpressureMonitor = null;
+        }
+    }
+
     private startSocketServer(port: number, payoutMode: PayoutMode) {
         const listener: StratumListenerState = {
             port,
@@ -132,6 +175,7 @@ export class StratumV1Service implements OnModuleInit {
         const server = new Server(async (socket: Socket) => {
             socket.setTimeout(this.getSocketTimeoutMs());
             socket.setKeepAlive(true, this.getTcpKeepAliveInitialDelayMs());
+            socket.setNoDelay(true);
 
             let client: StratumV1Client | StratumV2Client = null;
             let protocol: 'v1' | 'v2' | null = null;
@@ -152,6 +196,9 @@ export class StratumV1Service implements OnModuleInit {
                         const initializedClient = protocol === 'v2'
                             || (currentClient as StratumV1Client).extraNonceAndSessionId != null;
                         await currentClient.destroy();
+                        if (protocol === 'v1') {
+                            this.clients.delete(currentClient as StratumV1Client);
+                        }
                         if (initializedClient) {
                             if (reason == 'Error') {
                                 this.errorClosure++;
@@ -229,7 +276,7 @@ export class StratumV1Service implements OnModuleInit {
     }
 
     private createV1Client(socket: Socket, accountingProtocol: 'sv1' | 'sv1_tls', payoutMode: PayoutMode): StratumV1Client {
-        return new StratumV1Client(
+        const client = new StratumV1Client(
             socket,
             this.stratumV1JobsService,
             this.bitcoinRpcService,
@@ -244,6 +291,8 @@ export class StratumV1Service implements OnModuleInit {
             accountingProtocol,
             payoutMode,
         );
+        this.clients.add(client);
+        return client;
     }
 
     private startSecureSocketServer(port: number, payoutMode: PayoutMode) {
@@ -273,6 +322,7 @@ export class StratumV1Service implements OnModuleInit {
         const server = createServer(tlsOptions, async (socket: TLSSocket) => {
             socket.setTimeout(this.getSocketTimeoutMs());
             socket.setKeepAlive(true, this.getTcpKeepAliveInitialDelayMs());
+            socket.setNoDelay(true);
 
             const client = this.createV1Client(socket, 'sv1_tls', payoutMode);
             let cleanedUp = false;
@@ -286,6 +336,7 @@ export class StratumV1Service implements OnModuleInit {
                 try {
                     const initializedClient = client.extraNonceAndSessionId != null;
                     await client.destroy();
+                    this.clients.delete(client);
                     if (initializedClient) {
                         if (reason === 'Error') {
                             this.errorClosure++;
@@ -428,6 +479,217 @@ export class StratumV1Service implements OnModuleInit {
 
     private getEventLoopP95Ms() {
         return Math.round(this.eventLoopDelay.percentile(95) / 1e6);
+    }
+
+    private broadcastMiningJob(jobTemplate: import('./stratum-v1-jobs.service').IJobTemplate): void {
+        const fanoutStartedAtMs = Date.now();
+        const startedAt = process.hrtime.bigint();
+        const totalClients = this.clients.size;
+        const targetClientsPerWorker = this.getPositiveIntegerEnv(
+            'STRATUM_FANOUT_TARGET_CLIENTS_PER_WORKER',
+            DEFAULT_FANOUT_TARGET_CLIENTS_PER_WORKER,
+        );
+        const milestoneIndexes = {
+            p50: Math.max(1, Math.ceil(totalClients * 0.5)),
+            p95: Math.max(1, Math.ceil(totalClients * 0.95)),
+            p99: Math.max(1, Math.ceil(totalClients * 0.99)),
+        };
+        const milestoneMs: { p50?: number; p95?: number; p99?: number } = {};
+        let visited = 0;
+        let written = 0;
+        let skipped = 0;
+        let backpressured = 0;
+        let closed = 0;
+        let errors = 0;
+        let preStaged = 0;
+        let bytesQueued = 0;
+        let maxBufferedBytes = 0;
+
+        const elapsedMs = () => Number(process.hrtime.bigint() - startedAt) / 1e6;
+        for (const client of this.clients) {
+            visited++;
+            try {
+                const result = client.broadcastMiningJob(jobTemplate);
+                if (result.preStaged) {
+                    preStaged++;
+                }
+                bytesQueued += result.bytes;
+                maxBufferedBytes = Math.max(maxBufferedBytes, result.bufferedBytes);
+                switch (result.status) {
+                    case 'written': written++; break;
+                    case 'backpressured': backpressured++; break;
+                    case 'closed': closed++; break;
+                    case 'error': errors++; break;
+                    default: skipped++; break;
+                }
+            } catch (error) {
+                errors++;
+                void client.destroy();
+            }
+
+            if (milestoneMs.p50 == null && visited >= milestoneIndexes.p50) {
+                milestoneMs.p50 = elapsedMs();
+            }
+            if (milestoneMs.p95 == null && visited >= milestoneIndexes.p95) {
+                milestoneMs.p95 = elapsedMs();
+            }
+            if (milestoneMs.p99 == null && visited >= milestoneIndexes.p99) {
+                milestoneMs.p99 = elapsedMs();
+            }
+        }
+
+        if (!this.shouldLogJobFanout(jobTemplate.blockData.isNewBlock, errors)) {
+            return;
+        }
+
+        console.log(JSON.stringify({
+            event: 'stratum_job_fanout',
+            eventId: jobTemplate.blockData.notificationEventId,
+            sourceToFanoutStartMs: jobTemplate.blockData.sourceNotificationReceivedAtMs == null
+                ? undefined
+                : fanoutStartedAtMs - jobTemplate.blockData.sourceNotificationReceivedAtMs,
+            masterPrepareMs: jobTemplate.blockData.notificationPreparedAtMs == null
+                || jobTemplate.blockData.sourceNotificationReceivedAtMs == null
+                ? undefined
+                : jobTemplate.blockData.notificationPreparedAtMs
+                    - jobTemplate.blockData.sourceNotificationReceivedAtMs,
+            masterPublishRequestMs: jobTemplate.blockData.notificationPublishedAtMs == null
+                || jobTemplate.blockData.sourceNotificationReceivedAtMs == null
+                ? undefined
+                : jobTemplate.blockData.notificationPublishedAtMs
+                    - jobTemplate.blockData.sourceNotificationReceivedAtMs,
+            masterToWorkerReceiveMs: jobTemplate.blockData.notificationPublishedAtMs == null
+                || jobTemplate.blockData.notificationWorkerReceivedAtMs == null
+                ? undefined
+                : jobTemplate.blockData.notificationWorkerReceivedAtMs
+                    - jobTemplate.blockData.notificationPublishedAtMs,
+            workerReceiveToHandleMs: jobTemplate.blockData.notificationWorkerReceivedAtMs == null
+                || jobTemplate.blockData.notificationWorkerHandledAtMs == null
+                ? undefined
+                : jobTemplate.blockData.notificationWorkerHandledAtMs
+                    - jobTemplate.blockData.notificationWorkerReceivedAtMs,
+            workerHandleToFanoutStartMs: jobTemplate.blockData.notificationWorkerHandledAtMs == null
+                ? undefined
+                : fanoutStartedAtMs - jobTemplate.blockData.notificationWorkerHandledAtMs,
+            redisToFanoutStartMs: jobTemplate.blockData.notificationPublishedAtMs == null
+                ? undefined
+                : fanoutStartedAtMs - jobTemplate.blockData.notificationPublishedAtMs,
+            templateId: jobTemplate.blockData.id,
+            height: jobTemplate.blockData.height,
+            jobType: jobTemplate.blockData.jobType,
+            isNewBlock: jobTemplate.blockData.isNewBlock,
+            cleanJobs: jobTemplate.blockData.clearJobs,
+            clients: totalClients,
+            targetClientsPerWorker,
+            overTargetClients: Math.max(0, totalClients - targetClientsPerWorker),
+            written,
+            skipped,
+            backpressured,
+            closed,
+            errors,
+            preStaged,
+            bytesQueued,
+            maxBufferedBytes,
+            milestoneMs,
+            totalMs: elapsedMs(),
+        }));
+    }
+
+    private activateAndBroadcastPrestage(activation: Sv1PrestageActivation): void {
+        const jobTemplate = this.stratumV1JobsService.activateLatestPrestage(activation);
+        if (jobTemplate == null) {
+            console.warn(JSON.stringify({
+                event: 'sv1_prestage_activation_miss',
+                eventId: activation.eventId,
+                height: activation.height,
+                payoutMode: activation.payoutMode,
+                previousBlockHash: activation.previousBlockHash,
+                workerReceivedAtMs: activation.workerReceivedAtMs,
+            }));
+            return;
+        }
+        this.broadcastMiningJob(jobTemplate);
+    }
+
+    private queuePrestageMiningJob(
+        jobTemplate: import('./stratum-v1-jobs.service').IJobTemplate,
+    ): void {
+        const payoutMode = jobTemplate.blockData.payoutMode === 'pplns' ? 'pplns' : 'solo';
+        this.pendingPrestageJobs.set(payoutMode, jobTemplate);
+        if (this.prestageDrainRunning) {
+            return;
+        }
+        this.prestageDrainRunning = true;
+        const generation = this.prestageGeneration;
+        void this.drainPrestageMiningJobs(generation).finally(() => {
+            this.prestageDrainRunning = false;
+            if (generation === this.prestageGeneration
+                && this.pendingPrestageJobs.size > 0) {
+                const latest = this.pendingPrestageJobs.values().next().value;
+                if (latest != null) {
+                    this.queuePrestageMiningJob(latest);
+                }
+            }
+        });
+    }
+
+    private async drainPrestageMiningJobs(generation: number): Promise<void> {
+        while (generation === this.prestageGeneration
+            && this.pendingPrestageJobs.size > 0) {
+            const [payoutMode, jobTemplate] = this.pendingPrestageJobs.entries().next().value as [
+                PayoutMode,
+                import('./stratum-v1-jobs.service').IJobTemplate,
+            ];
+            this.pendingPrestageJobs.delete(payoutMode);
+            const clients = [...this.clients];
+            const batchSize = this.getPositiveIntegerEnv(
+                'SV1_PRESTAGE_BATCH_SIZE',
+                DEFAULT_PRESTAGE_BATCH_SIZE,
+            );
+            const startedAt = process.hrtime.bigint();
+            let staged = 0;
+            let skipped = 0;
+            let errors = 0;
+            for (let offset = 0; offset < clients.length; offset += batchSize) {
+                if (generation !== this.prestageGeneration) {
+                    return;
+                }
+                for (const client of clients.slice(offset, offset + batchSize)) {
+                    try {
+                        if (client.preStageMiningJob(jobTemplate)) {
+                            staged++;
+                        } else {
+                            skipped++;
+                        }
+                    } catch {
+                        errors++;
+                    }
+                }
+                // Staging is deliberately background work. Yield between bounded
+                // batches so share parsing and urgent bridge callbacks stay live.
+                if (offset + batchSize < clients.length) {
+                    await new Promise<void>(resolve => setImmediate(resolve));
+                }
+            }
+            console.log(JSON.stringify({
+                event: 'sv1_job_prestage',
+                eventId: jobTemplate.blockData.notificationEventId,
+                height: jobTemplate.blockData.height,
+                payoutMode,
+                clients: clients.length,
+                staged,
+                skipped,
+                errors,
+                totalMs: Number(process.hrtime.bigint() - startedAt) / 1e6,
+            }));
+        }
+    }
+
+    private shouldLogJobFanout(isNewBlock: boolean, errors: number): boolean {
+        if (errors > 0 || isNewBlock) {
+            return true;
+        }
+        return process.env.STRATUM_FANOUT_LOG_ENABLED?.toLowerCase() === 'true';
     }
 
     private isBackpressureDisabled() {
