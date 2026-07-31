@@ -201,6 +201,7 @@ describe('ShareAccountingService', () => {
                     hashRateLast10Minutes: '458129844.9',
                     hashRateLastHour: '114532461.2',
                     latestShareAt: new Date('2026-06-07T12:10:00Z'),
+                    oldestShareAt: new Date('2026-06-01T08:00:00Z'),
                 }]),
         };
         const service = new ShareAccountingService(repository as any);
@@ -224,6 +225,7 @@ describe('ShareAccountingService', () => {
             networkDifficultyPercent: 0,
             blockCandidateCount: 0,
             latestShareAt: '2026-06-07T12:10:00.000Z',
+            oldestShareAt: '2026-06-01T08:00:00.000Z',
             protocolBreakdown: [],
         });
         expect(repository.query).toHaveBeenNthCalledWith(
@@ -232,6 +234,39 @@ describe('ShareAccountingService', () => {
             ['bc1qtest'],
         );
         expect(repository.query).toHaveBeenCalledTimes(1);
+    });
+
+    it('should anchor oldestShareAt to retained share history, independent of live sessions', async () => {
+        // A worker-group summary is keyed by (address, clientName) in the
+        // rollup — no session/client id in the filter — so the anchor a UI
+        // uses for "observed history" must not move when the miner
+        // reconnects under a fresh session. MIN(bucket) over the group's
+        // retained rows is that anchor; with no rows it reads null.
+        const repository = {
+            query: jest.fn()
+                .mockResolvedValueOnce([{
+                    totalAcceptedShares: '100',
+                    totalCreditedDifficulty: '3200',
+                    acceptedSharesLastDay: '10',
+                    creditedDifficultyLastDay: '320',
+                    latestShareAt: new Date('2026-06-07T12:10:00Z'),
+                    oldestShareAt: new Date('2026-05-01T00:00:00Z'),
+                }])
+                .mockResolvedValueOnce([{}]),
+        };
+        const service = new ShareAccountingService(repository as any);
+
+        await expect(service.getWorkerGroupSummary('bc1qtest', 'o266')).resolves.toEqual(expect.objectContaining({
+            oldestShareAt: '2026-05-01T00:00:00.000Z',
+        }));
+        const [groupSql, groupParams] = repository.query.mock.calls[0];
+        expect(groupSql).toContain('MIN("bucket") AS "oldestShareAt"');
+        expect(groupSql).not.toContain('"clientId"');
+        expect(groupParams).toEqual(['bc1qtest', 'o266']);
+
+        await expect(service.getWorkerGroupSummary('bc1qtest', 'nevermined')).resolves.toEqual(expect.objectContaining({
+            oldestShareAt: null,
+        }));
     });
 
     it('should serve API-only address accounting from the share rollup instead of empty summaries', async () => {
