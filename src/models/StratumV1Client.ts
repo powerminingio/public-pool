@@ -961,8 +961,9 @@ export class StratumV1Client {
 
     /**
      * Set a new session difficulty on the wire: set_difficulty followed by a
-     * clean-jobs template refresh so the change takes effect immediately
-     * without invalidating in-flight work against the shared cached template.
+     * clean-jobs template refresh so the change takes effect immediately. The
+     * refresh serves the latest cached template with a bumped timestamp rather
+     * than mutating or re-sending the shared template as byte-identical work.
      */
     private async applySessionDifficulty(targetDiff: number) {
         this.sessionDifficulty = targetDiff;
