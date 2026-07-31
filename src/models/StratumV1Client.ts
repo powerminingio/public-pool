@@ -459,6 +459,22 @@ export class StratumV1Client {
             }
             case eRequestMethod.SET_PAYOUT: {
 
+                // set_payout is a solo-mode concept (see getJobMinerAddress):
+                // in pplns the coinbase pays the snapshot's payees, so a switch
+                // here would ack success and force a clean-jobs refresh without
+                // changing payout behaviour. Reject instead of pretending.
+                if (this.payoutMode !== 'solo') {
+                    const err = new StratumErrorMessage(
+                        parsedMessage.id,
+                        eStratumErrorCode.OtherUnknown,
+                        'mining.set_payout is only available on solo payout connections').response();
+                    const success = await this.write(err);
+                    if (!success) {
+                        return;
+                    }
+                    break;
+                }
+
                 const setPayoutMessage = plainToInstance(
                     SetPayoutMessage,
                     parsedMessage,
