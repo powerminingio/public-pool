@@ -83,6 +83,7 @@ describe('StratumV1Client', () => {
             connectedClientCount: jest.fn(async () => clients.size),
             updateBestDifficultyIfHigher: jest.fn().mockResolvedValue({ affected: 1 }),
             updateHashRate: jest.fn().mockResolvedValue(undefined),
+            heartbeat: jest.fn().mockResolvedValue(undefined),
         } as any;
 
         configService = {
@@ -588,7 +589,8 @@ describe('StratumV1Client', () => {
 
 
 
-        expect(socketWriteSpy).toHaveBeenCalledWith(Buffer.from(`{"id":null,"method":"mining.notify","params":["1","171592f223740e92d223f6e68bff25279af7ac4f2246451e0000000200000000","02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1b03c943255075626c69632d506f6f6c","ffffffff02b59f250000000000160014e6f22ca44dc800e9d049621a3b9a42c509f1c4bc0000000000000000266a24aa21a9edbd3d1d916aa0b57326a2d88ebe1b68a1d7c48585f26d8335fe6a94b62755f64c00000000",["175335649d5e8746982969ec88f52e85ac9917106fba5468e699c8879ab974a1","d5644ab3e708c54cd68dc5aedc92b8d3037449687f92ec41ed6e37673d969d4a","5c9ec187517edc0698556cca5ce27e54c96acb014770599ed9df4d4937fbf2b0"],"20000000","192495f8","${MockRecording1.TIME}",true]}\n`));
+        // coinbase input script carries the pool.powermining.io tag
+        expect(socketWriteSpy).toHaveBeenCalledWith(Buffer.from(`{"id":null,"method":"mining.notify","params":["1","171592f223740e92d223f6e68bff25279af7ac4f2246451e0000000200000000","02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2303c94325706f6f6c2e706f7765726d696e696e672e696f","ffffffff02b59f250000000000160014e6f22ca44dc800e9d049621a3b9a42c509f1c4bc0000000000000000266a24aa21a9edbd3d1d916aa0b57326a2d88ebe1b68a1d7c48585f26d8335fe6a94b62755f64c00000000",["175335649d5e8746982969ec88f52e85ac9917106fba5468e699c8879ab974a1","d5644ab3e708c54cd68dc5aedc92b8d3037449687f92ec41ed6e37673d969d4a","5c9ec187517edc0698556cca5ce27e54c96acb014770599ed9df4d4937fbf2b0"],"20000000","192495f8","${MockRecording1.TIME}",true]}\n`));
 
 
         emitMessage(MockRecording1.MINING_SUBMIT);
@@ -1205,6 +1207,275 @@ describe('StratumV1Client', () => {
         expect((client as any).write).lastCalledWith(`{"id":5,"error":null,"result":true}\n`);
     });
 
+
+    describe('mining.set_payout', () => {
+
+        const AUTHORIZED_ADDRESS = 'tb1qumezefzdeqqwn5zfvgdrhxjzc5ylr39uhuxcz4';
+        const AUTHORIZED_SCRIPT = bitcoinjs.payments.p2wpkh({ address: AUTHORIZED_ADDRESS, network: bitcoinjs.networks.testnet }).output.toString('hex');
+        const NEW_PAYOUT = bitcoinjs.payments.p2wpkh({ hash: Buffer.alloc(20, 0xab), network: bitcoinjs.networks.testnet });
+        const NEW_PAYOUT_ADDRESS = NEW_PAYOUT.address;
+        const NEW_PAYOUT_SCRIPT = NEW_PAYOUT.output.toString('hex');
+
+        const lastNotifyParams = (written: string[]) => {
+            const notifies = written.filter(m => m.includes('"mining.notify"'));
+            expect(notifies.length).toBeGreaterThan(0);
+            return JSON.parse(notifies[notifies.length - 1]).params;
+        };
+
+        // mining.notify payloads go straight out through socket.write as a
+        // pre-rendered Buffer (broadcastMiningJob), while responses/acks go
+        // through the client's async write(). Capture both into one transcript.
+        const captureWrites = () => {
+            const written: string[] = [];
+            jest.spyOn(client as any, 'write').mockImplementation((data: string) => {
+                written.push(data);
+                return Promise.resolve(true);
+            });
+            jest.spyOn(socket, 'write').mockImplementation((data: any) => {
+                written.push(data.toString());
+                return true;
+            });
+            return written;
+        };
+
+        it('should switch the coinbase payout address and push a clean job on the same extranonce', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            // the job served after authorize pays the authorized address
+            let coinbase = lastNotifyParams(written)[2] + lastNotifyParams(written)[3];
+            expect(coinbase).toContain(AUTHORIZED_SCRIPT);
+
+            const extraNonceBefore = client.extraNonceAndSessionId;
+            const writesBefore = written.length;
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            // acked, and a fresh clean job pays the new address — with no re-subscribe
+            // and no extranonce change
+            expect(written.slice(writesBefore)).toContain('{"id":7,"error":null,"result":true}\n');
+            const notify = lastNotifyParams(written);
+            coinbase = notify[2] + notify[3];
+            expect(coinbase).toContain(NEW_PAYOUT_SCRIPT);
+            expect(coinbase).not.toContain(AUTHORIZED_SCRIPT);
+            expect(notify[8]).toBe(true); // clean_jobs
+            expect(client.extraNonceAndSessionId).toBe(extraNonceBefore);
+            expect(written.slice(writesBefore).some(m => m.includes('mining.set_extranonce'))).toBe(false);
+        });
+
+        it('should answer a set_payout without params with an error, not a dropped connection', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            emitMessage(`{"id": 9, "method": "mining.set_payout"}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            expect(socket.end).not.toHaveBeenCalled();
+            const response = written.find(m => m.includes('"id":9'));
+            expect(response).toBeDefined();
+            expect(response).toContain('"result":null');
+        });
+
+        it('should reject set_payout on a non-solo connection without touching the payout or jobs', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            // The handshake above ran in the default solo mode so the harness
+            // serves jobs; the guard itself only reads payoutMode at dispatch.
+            (client as any).payoutMode = 'pplns';
+            const payoutBefore = (client as any).currentPayoutAddress;
+            const writesBefore = written.length;
+
+            emitMessage(`{"id": 11, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            expect(socket.end).not.toHaveBeenCalled();
+            const response = written.find(m => m.includes('"id":11'));
+            expect(response).toBeDefined();
+            expect(response).toContain('"result":null');
+            expect(response).toContain('only available on solo');
+            // no ack, no payout switch, no clean-jobs refresh
+            expect(written.slice(writesBefore)).not.toContain('{"id":11,"error":null,"result":true}\n');
+            expect((client as any).currentPayoutAddress).toBe(payoutBefore);
+            expect(written.slice(writesBefore).some(m => m.includes('"mining.notify"'))).toBe(false);
+        });
+
+        it('should attribute shares to the job\'s payout address across a switch', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const jobBefore = lastNotifyParams(written)[0];
+            expect(jobBefore).toEqual('1'); // the recorded MINING_SUBMIT references job 1
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const jobAfter = lastNotifyParams(written)[0];
+            expect(jobAfter).not.toEqual(jobBefore);
+
+            jest.useRealTimers();
+
+            // in-flight share computed against the pre-switch job: still accepted,
+            // attributed to the OLD address
+            emitMessage(MockRecording1.MINING_SUBMIT);
+            await new Promise((r) => setTimeout(r, 1000));
+            expect(written).toContain('{"id":5,"error":null,"result":true}\n');
+
+            // share on the post-switch job: attributed to the NEW address
+            // (session difficulty was suggested to 0, so any nonce clears it)
+            emitMessage(`{"id": 8, "method": "mining.submit", "params": ["${AUTHORIZED_ADDRESS}.bitaxe3", "${jobAfter}", "c708000000000001", "${MockRecording1.TIME}", "ed460d91", "00002000"]}`);
+            await new Promise((r) => setTimeout(r, 1000));
+            expect(written).toContain('{"id":8,"error":null,"result":true}\n');
+
+            const recorded = shareAccountingService.recordAcceptedShare.mock.calls.map(call => call[0]);
+            expect(recorded.length).toBe(2);
+            expect(recorded.filter(r => r.address === AUTHORIZED_ADDRESS && r.jobId === jobBefore).length).toBe(1);
+            expect(recorded.filter(r => r.address === NEW_PAYOUT_ADDRESS && r.jobId === jobAfter).length).toBe(1);
+        });
+
+        it('should record shares under the job\'s worker param across a switch', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const jobBefore = lastNotifyParams(written)[0];
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const jobAfter = lastNotifyParams(written)[0];
+            expect(jobAfter).not.toEqual(jobBefore);
+
+            jest.useRealTimers();
+
+            // in-flight share on the pre-switch job: recorded under the worker the
+            // job was built for (the authorized worker), not the current identity
+            emitMessage(MockRecording1.MINING_SUBMIT);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            // share on the post-switch job: recorded under the set_payout worker
+            emitMessage(`{"id": 8, "method": "mining.submit", "params": ["${AUTHORIZED_ADDRESS}.bitaxe3", "${jobAfter}", "c708000000000001", "${MockRecording1.TIME}", "ed460d91", "00002000"]}`);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            const recorded = shareAccountingService.recordAcceptedShare.mock.calls.map(call => call[0]);
+            expect(recorded.length).toBe(2);
+            expect(recorded.filter(r => r.jobId === jobBefore && r.clientName === 'bitaxe3' && r.address === AUTHORIZED_ADDRESS).length).toBe(1);
+            expect(recorded.filter(r => r.jobId === jobAfter && r.clientName === 'o32' && r.address === NEW_PAYOUT_ADDRESS).length).toBe(1);
+        });
+
+        it('should fall back to the authorized worker when set_payout omits the worker param', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            const jobAfter = lastNotifyParams(written)[0];
+
+            jest.useRealTimers();
+            emitMessage(`{"id": 8, "method": "mining.submit", "params": ["${AUTHORIZED_ADDRESS}.bitaxe3", "${jobAfter}", "c708000000000001", "${MockRecording1.TIME}", "ed460d91", "00002000"]}`);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            const recorded = shareAccountingService.recordAcceptedShare.mock.calls.map(call => call[0]);
+            expect(recorded.length).toBe(1);
+            expect(recorded[0].address).toBe(NEW_PAYOUT_ADDRESS);
+            expect(recorded[0].clientName).toBe('bitaxe3');
+        });
+
+        it('should maintain a virtual worker presence per (address, worker)', async () => {
+            jest.spyOn(client as any, 'write').mockImplementation(() => Promise.resolve(true));
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            const insertMock = clientService.insert as jest.Mock;
+            const insertsAfterAuthorize = insertMock.mock.calls.length; // the connection's own row
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+
+            // one virtual row inserted for the new identity
+            expect(insertMock.mock.calls.length).toBe(insertsAfterAuthorize + 1);
+            expect(insertMock).toHaveBeenLastCalledWith(expect.objectContaining({
+                address: NEW_PAYOUT_ADDRESS,
+                clientName: 'o32',
+                sessionId: expect.any(String),
+                bestDifficulty: 0,
+            }));
+            const virtualEntity = await insertMock.mock.results[insertMock.mock.results.length - 1].value;
+
+            // a repeat switch to the same identity refreshes the row, no new insert
+            emitMessage(`{"id": 9, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            expect(insertMock.mock.calls.length).toBe(insertsAfterAuthorize + 1);
+            expect((clientService as any).heartbeat).toHaveBeenCalledWith(virtualEntity.id);
+
+            // switching back to the authorized identity needs no virtual row
+            emitMessage(`{"id": 10, "method": "mining.set_payout", "params": ["${AUTHORIZED_ADDRESS}", "bitaxe3"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            expect(insertMock.mock.calls.length).toBe(insertsAfterAuthorize + 1);
+
+            // the virtual presence dies with the connection
+            await client.destroy();
+            expect(clientService.delete).toHaveBeenCalledWith(virtualEntity.id);
+        });
+
+        it('should key share accounting and best difficulty to the virtual identity row', async () => {
+            const written = captureWrites();
+
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+
+            emitMessage(`{"id": 7, "method": "mining.set_payout", "params": ["${NEW_PAYOUT_ADDRESS}", "o32"]}`);
+            await new Promise((r) => setTimeout(r, 100));
+            const jobAfter = lastNotifyParams(written)[0];
+
+            const insertMock = clientService.insert as jest.Mock;
+            const virtualEntity = await insertMock.mock.results[insertMock.mock.results.length - 1].value;
+            expect(virtualEntity.clientName).toBe('o32');
+
+            jest.useRealTimers();
+            emitMessage(`{"id": 8, "method": "mining.submit", "params": ["${AUTHORIZED_ADDRESS}.bitaxe3", "${jobAfter}", "c708000000000001", "${MockRecording1.TIME}", "ed460d91", "00002000"]}`);
+            await new Promise((r) => setTimeout(r, 1000));
+
+            // the share is keyed to the virtual identity's row, so per-worker
+            // session summaries aggregate per payout identity
+            const recorded = shareAccountingService.recordAcceptedShare.mock.calls.map(call => call[0]);
+            expect(recorded.length).toBe(1);
+            expect(recorded[0].clientId).toBe(virtualEntity.id);
+            expect(recorded[0].sessionId).toBe(MockRecording1.EXTRA_NONCE);
+
+            // best difficulty ratchets on the virtual row and the payout address
+            const bestCalls = (clientService.updateBestDifficultyIfHigher as jest.Mock).mock.calls;
+            expect(bestCalls.some(call => call[0] === virtualEntity.id)).toBe(true);
+            const addressBestCalls = (addressSettings.updateBestDifficultyIfHigher as jest.Mock).mock.calls;
+            expect(addressBestCalls.some(call => call[0] === NEW_PAYOUT_ADDRESS)).toBe(true);
+        });
+
+    });
 
 
 });

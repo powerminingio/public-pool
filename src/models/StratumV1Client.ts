@@ -32,6 +32,7 @@ import { AddressObject, MiningJob } from './MiningJob';
 import { AuthorizationMessage } from './stratum-messages/AuthorizationMessage';
 import { ConfigurationMessage } from './stratum-messages/ConfigurationMessage';
 import { MiningSubmitMessage } from './stratum-messages/MiningSubmitMessage';
+import { SetPayoutMessage } from './stratum-messages/SetPayoutMessage';
 import { StratumErrorMessage } from './stratum-messages/StratumErrorMessage';
 import { SubscriptionMessage } from './stratum-messages/SubscriptionMessage';
 import { EXTRANONCE1_SIZE_BYTES } from './stratum.constants';
@@ -47,6 +48,10 @@ const DEFAULT_SUBMISSION_DEDUP_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_SUBMISSION_DEDUP_MAX_ENTRIES = 10_000;
 const DEFAULT_MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
 const VERSION_ROLLING_MASK = 0x1fffe000;
+// How many payout identities a single connection remembers having been served.
+// Only a bound on memory: how long a job stays submittable is the jobs service's
+// own retention (5 min by default), after which the job is gone regardless.
+const SERVED_PAYOUT_IDENTITY_MAX_ENTRIES = 1_000;
 
 export interface MiningJobBroadcastResult {
     status: 'written' | 'backpressured' | 'skipped' | 'closed' | 'error';
@@ -62,6 +67,33 @@ export class StratumV1Client {
     public clientSubscription: SubscriptionMessage;
     private clientConfiguration: ConfigurationMessage;
     private clientAuthorization: AuthorizationMessage;
+    // The address this connection's coinbase currently pays. Initialized to the
+    // authorized address; may be changed at runtime via mining.set_payout (the
+    // connection's extranonce1 stays stable). A connection that never sends
+    // set_payout keeps this equal to clientAuthorization.address — i.e. unchanged
+    // behaviour.
+    private currentPayoutAddress: string;
+    // Every payout identity this connection has actually been served a job for,
+    // most-recently-served last. A submit is only accepted against a job whose
+    // identity is in here (see isOwnedSubmissionContext) — so after a
+    // mining.set_payout switch a late in-flight share for the PREVIOUS address
+    // still validates, while a connection can never submit against an identity
+    // it was never served. Bounded (LRU) so a client looping set_payout cannot
+    // grow it without end.
+    private servedPayoutIdentities = new Set<string>();
+    // The worker label of the payout identity, alongside currentPayoutAddress.
+    // Initialized to the authorized worker; a mining.set_payout with the
+    // optional second param overrides it, and one without it falls back to the
+    // authorized worker (the pre-worker-param behaviour).
+    private currentPayoutWorker: string;
+    // jobId -> the worker label THIS connection served that job under. Jobs are
+    // shared between connections by payout identity on this base, so the label
+    // (a per-connection notion — two rigs on one address routinely carry
+    // different worker names) cannot live on the MiningJob itself. Recording it
+    // per connection at serve time keeps a late in-flight submit after a
+    // set_payout switch attributed to the identity the work was built for.
+    // Bounded (LRU) exactly like servedPayoutIdentities.
+    private servedJobWorkers = new Map<string, string>();
     private clientSuggestedDifficulty: SuggestDifficulty;
     private backgroundWork: NodeJS.Timeout[] = [];
     private readonly socketDataHandler: (data: Buffer) => void;
@@ -75,6 +107,14 @@ export class StratumV1Client {
 
     private clientEntity: ClientEntity;
     private creatingEntity: Promise<void>;
+    // Virtual worker presences maintained via mining.set_payout: one ClientEntity
+    // row per (payout address, worker) this connection has served that differs
+    // from the authorized identity — those identities have no connection of their
+    // own, so without these rows the address page's workers list would be empty.
+    // Keyed address\0worker; the map holds the insert promise so a submit racing
+    // the row creation awaits the same row instead of duplicating it.
+    private virtualWorkerEntities = new Map<string, Promise<ClientEntity>>();
+    private virtualWorkerCapWarned = false;
 
     public extraNonceAndSessionId: string;
     public sessionStart: Date;
@@ -139,9 +179,22 @@ export class StratumV1Client {
         this.backgroundWork = [];
         this.miningSubmissionHashes.clear();
 
-        if (this.clientEntity?.id) {
-            const clientId = this.clientEntity.id;
-            await this.clientService.delete(clientId);
+        // The connection's own row and the virtual worker presences maintained
+        // via set_payout live and die with the connection. Soft-delete them in
+        // parallel, tolerating per-row failures: destroy() is awaited from the
+        // socket close handler, where a rejection would go unhandled — and a
+        // failed soft-delete only leaves a row to age out of the report window.
+        const virtualEntities = await Promise.all(
+            [...this.virtualWorkerEntities.values()].map((pending) => pending.catch(() => null))
+        );
+        this.virtualWorkerEntities.clear();
+        const rowIds = [this.clientEntity?.id, ...virtualEntities.map((entity) => entity?.id)]
+            .filter((id): id is string => id != null);
+        const deletions = await Promise.allSettled(rowIds.map((id) => this.clientService.delete(id)));
+        for (const deletion of deletions) {
+            if (deletion.status === 'rejected') {
+                console.warn(`Failed to soft-delete client row on disconnect: ${deletion.reason?.message ?? deletion.reason}`);
+            }
         }
     }
 
@@ -291,6 +344,8 @@ export class StratumV1Client {
 
                 if (errors.length === 0) {
                     this.clientAuthorization = authorizationMessage;
+                    this.currentPayoutAddress = authorizationMessage.address;
+                    this.currentPayoutWorker = authorizationMessage.worker;
                     if (this.clientSuggestedDifficulty == null && this.clientAuthorization.startingDiff != null && this.clientAuthorization.startingDiff > this.sessionDifficulty) {
                         this.sessionDifficulty = this.clientAuthorization.startingDiff;
                         this.sessionDifficultyTarget = DifficultyUtils.difficultyToTarget(this.sessionDifficulty);
@@ -437,6 +492,88 @@ export class StratumV1Client {
                 }
                 break;
             }
+            case eRequestMethod.SET_PAYOUT: {
+
+                // set_payout is a solo-mode concept (see getJobMinerAddress):
+                // in pplns the coinbase pays the snapshot's payees, so a switch
+                // here would ack success and force a clean-jobs refresh without
+                // changing payout behaviour. Reject instead of pretending.
+                if (this.payoutMode !== 'solo') {
+                    const err = new StratumErrorMessage(
+                        parsedMessage.id,
+                        eStratumErrorCode.OtherUnknown,
+                        'mining.set_payout is only available on solo payout connections').response();
+                    const success = await this.write(err);
+                    if (!success) {
+                        return;
+                    }
+                    break;
+                }
+
+                const setPayoutMessage = plainToInstance(
+                    SetPayoutMessage,
+                    parsedMessage,
+                );
+
+                const validatorOptions: ValidatorOptions = {
+                    whitelist: true,
+                    //forbidNonWhitelisted: true,
+                };
+
+                const errors = await validate(setPayoutMessage, validatorOptions);
+
+                if (errors.length === 0) {
+                    this.currentPayoutAddress = setPayoutMessage.address;
+                    this.currentPayoutWorker = setPayoutMessage.worker ?? this.clientAuthorization?.worker;
+                    const success = await this.write(JSON.stringify(setPayoutMessage.response()) + '\n');
+                    if (!success) {
+                        return;
+                    }
+
+                    // If we're already serving work, push a fresh job paying the new
+                    // address immediately (stable extranonce1, new coinbase) so the
+                    // switch takes effect without waiting for the next template. Same
+                    // clean-jobs refresh pattern as checkDifficulty(); the new coinbase
+                    // guarantees the work is not byte-identical. Old jobs stay in the
+                    // jobs service (5 min) so a late in-flight submit for the previous
+                    // address still validates and is attributed correctly.
+                    if (this.stratumInitialized) {
+                        // Register the presence before serving work for the identity so
+                        // a submit racing the switch finds the row (the map is populated
+                        // synchronously; the insert itself is awaited after the job push).
+                        const presence = this.ensurePayoutPresence();
+                        const jobTemplate = await this.getLatestPayoutJobTemplate();
+                        const nextTimestamp = Math.max(
+                            jobTemplate.block.timestamp,
+                            Math.floor(Date.now() / 1000),
+                            (this.lastSentMiningJobTimestamp ?? 0) + 1
+                        );
+                        const refreshedJobTemplate: IJobTemplate = {
+                            ...jobTemplate,
+                            block: Object.assign(new bitcoinjs.Block(), jobTemplate.block, {
+                                timestamp: nextTimestamp
+                            }),
+                            blockData: { ...jobTemplate.blockData, clearJobs: true }
+                        };
+                        this.broadcastMiningJob(refreshedJobTemplate, true);
+                        await presence;
+                    }
+                } else {
+                    console.error('Set payout validation error');
+                    const err = new StratumErrorMessage(
+                        setPayoutMessage.id,
+                        eStratumErrorCode.OtherUnknown,
+                        'Set payout validation error',
+                        errors).response();
+                    console.error(err);
+                    const success = await this.write(err);
+                    if (!success) {
+                        return;
+                    }
+                }
+
+                break;
+            }
             // default: {
             //     console.log("Invalid message");
             //     console.log(parsedMessage);
@@ -510,7 +647,7 @@ export class StratumV1Client {
         }
         const payoutInformation = this.getPayoutInformation(
             jobTemplate,
-            this.clientAuthorization.address,
+            this.getCurrentPayoutAddress(),
         );
         if (payoutInformation == null) {
             return false;
@@ -556,7 +693,7 @@ export class StratumV1Client {
             return { status: 'closed', bytes: 0, bufferedBytes: bufferedBeforeBuild };
         }
 
-        const payoutInformation = this.getPayoutInformation(jobTemplate, this.clientAuthorization.address);
+        const payoutInformation = this.getPayoutInformation(jobTemplate, this.getCurrentPayoutAddress());
         if (payoutInformation == null) {
             return { status: 'skipped', bytes: 0, bufferedBytes: this.socket.writableLength ?? 0 };
         }
@@ -616,6 +753,14 @@ export class StratumV1Client {
         }
         try {
             const accepted = this.socket.write(payload);
+            // The job is on the wire, so this identity's jobs are now submittable
+            // by this connection — including after a later mining.set_payout moves
+            // the connection on to another address.
+            this.rememberServedPayoutIdentity(job.ownership?.payoutIdentity ?? payoutIdentity);
+            // ...and the worker label this connection served it under, so a share
+            // arriving after a later switch is still recorded under the identity
+            // the work was built for.
+            this.rememberServedJobWorker(job.jobId, this.getCurrentPayoutWorker());
             this.lastSentMiningJobTimestamp = jobTemplate.block.timestamp;
             this.lastSentMiningJobSignature = signature;
             this.lastSentMiningTipKey = jobTemplate.blockData.tipKey;
@@ -670,6 +815,84 @@ export class StratumV1Client {
         await this.creatingEntity;
     }
 
+    private virtualWorkerKey(address: string, worker: string): string {
+        return `${address}\u0000${worker}`;
+    }
+
+    // Insert-or-refresh the virtual worker presence for the current payout
+    // identity. A set_payout identity has no connection of its own, so this row
+    // is what keeps it on the address page's workers list. Display-only: a
+    // failure is logged and retried at the next set_payout, never fatal to the
+    // connection. The row gets its OWN random sessionId — sessionId carries a
+    // unique index among live rows, so the connection's extranonce can't be
+    // reused (accepted shares keep recording the real extranonce).
+    private ensurePayoutPresence(): Promise<void> {
+        const address = this.currentPayoutAddress;
+        const worker = this.currentPayoutWorker ?? this.clientAuthorization.worker;
+        if (this.payoutMode !== 'solo') {
+            // In pplns the coinbase pays the snapshot's payees, so a set_payout
+            // identity never receives work of its own — a presence row for it
+            // would be a phantom worker on the address page.
+            return Promise.resolve();
+        }
+        if (address === this.clientAuthorization.address && worker === this.clientAuthorization.worker) {
+            // The authorized identity's presence is the connection's own row.
+            return Promise.resolve();
+        }
+        const key = this.virtualWorkerKey(address, worker);
+        const existing = this.virtualWorkerEntities.get(key);
+        if (existing == null) {
+            // Bound the presence table like every other per-connection identity
+            // structure. Beyond the cap new identities keep mining and
+            // attributing correctly (servedJobWorkers / share accounting are
+            // independent of this row) — they just don't get a workers-list
+            // presence row, instead of this map and the client table growing
+            // without end on a connection looping fresh (address, worker) pairs.
+            if (this.virtualWorkerEntities.size >= SERVED_PAYOUT_IDENTITY_MAX_ENTRIES) {
+                if (!this.virtualWorkerCapWarned) {
+                    this.virtualWorkerCapWarned = true;
+                    console.warn(`Virtual worker presence cap (${SERVED_PAYOUT_IDENTITY_MAX_ENTRIES}) reached for ${this.extraNonceAndSessionId}; further set_payout identities will not be listed as workers`);
+                }
+                return Promise.resolve();
+            }
+            const inserting = this.clientService.insert({
+                sessionId: this.getRandomHexString(),
+                address,
+                clientName: worker,
+                userAgent: this.clientSubscription.userAgent,
+                startTime: new Date(),
+                payoutMode: this.payoutMode,
+                bestDifficulty: 0
+            });
+            this.virtualWorkerEntities.set(key, inserting);
+            return inserting.then(() => undefined, (e) => {
+                // Retry with a fresh insert (and fresh random sessionId) next time.
+                this.virtualWorkerEntities.delete(key);
+                console.warn(`Failed to register virtual worker presence for ${address}.${worker}: ${e?.message ?? e}`);
+            });
+        }
+        return existing.then(
+            entity => this.clientService.heartbeat(entity.id).then(() => undefined),
+            () => undefined
+        ).catch((e) => {
+            console.warn(`Failed to refresh virtual worker presence for ${address}.${worker}: ${e?.message ?? e}`);
+        });
+    }
+
+    // The virtual presence row for a (payout address, worker) identity, or null
+    // for the authorized identity / an identity never registered (e.g. a
+    // set_payout that arrived before the stratum handshake completed).
+    private async virtualWorkerEntity(address: string, worker: string): Promise<ClientEntity | null> {
+        if (address === this.clientAuthorization.address && worker === this.clientAuthorization.worker) {
+            return null;
+        }
+        const pending = this.virtualWorkerEntities.get(this.virtualWorkerKey(address, worker));
+        if (pending == null) {
+            return null;
+        }
+        return await pending.catch(() => null);
+    }
+
     private async handleMiningSubmission(submission: MiningSubmitMessage) {
 
         const submissionContext = this.stratumV1JobsService.getSubmissionContext(submission.jobId);
@@ -689,6 +912,15 @@ export class StratumV1Client {
         }
 
         const { job, jobTemplate, status } = submissionContext;
+        // Attribute the share to the address the matched job's coinbase actually
+        // pays — which can differ from clientAuthorization.address after a
+        // mining.set_payout switch. Validated against the stored job above, so
+        // this is exact for in-flight work. Same for the worker label: it is the
+        // label this connection served THAT job under (set_payout's optional
+        // second param), so a late in-flight share lands under the identity the
+        // work was built for.
+        const minerAddress = this.getJobMinerAddress(job);
+        const minerWorker = this.getJobMinerWorker(job);
 
         const versionBits = this.parseUint32Hex(submission.versionMask);
         const nonce = this.parseUint32Hex(submission.nonce);
@@ -829,14 +1061,22 @@ export class StratumV1Client {
                 );
             }
             await this.ensureClientEntity();
+            // The virtual presence row for a set_payout identity (null for the
+            // authorized identity): shares carry ITS clientId so the address
+            // page's per-worker session summaries (rates, last-seen — keyed by
+            // clientId) aggregate per payout identity, not per connection.
+            const virtualEntity = await this.virtualWorkerEntity(minerAddress, minerWorker);
             try {
+                // Share statistics are keyed to the job's payout address (not the
+                // authorized identity) so a set_payout switch credits each address
+                // with exactly the work mined for it.
                 await this.shareAccountingService?.recordAcceptedShare({
                     protocol: this.accountingProtocol,
                     payoutMode: this.payoutMode,
-                    address: this.clientAuthorization.address,
-                    clientName: this.clientAuthorization.worker,
+                    address: minerAddress,
+                    clientName: minerWorker,
                     sessionId: this.extraNonceAndSessionId,
-                    clientId: this.clientEntity.id,
+                    clientId: (virtualEntity ?? this.clientEntity).id,
                     jobId: job.jobId,
                     jobTemplateId: job.jobTemplateId,
                     blockHeight: jobTemplate.blockData.height,
@@ -860,10 +1100,23 @@ export class StratumV1Client {
                 console.log(e);
             }
 
+            // Best-difficulty ratchets, each gated on its own row: the connection's,
+            // the payout identity's virtual row (when the share belongs to a
+            // set_payout identity), and the address-level high score — gated on the
+            // row matching minerAddress, NOT the connection's (a connection serving
+            // many identities would otherwise stop reporting a fresh identity's best
+            // once any identity had set a higher one).
+            const identityBestBefore = (virtualEntity ?? this.clientEntity).bestDifficulty;
             if (submissionDifficulty > this.clientEntity.bestDifficulty) {
                 await this.clientService.updateBestDifficultyIfHigher(this.clientEntity.id, submissionDifficulty);
                 this.clientEntity.bestDifficulty = submissionDifficulty;
-                await this.addressSettingsService.updateBestDifficultyIfHigher(this.clientAuthorization.address, submissionDifficulty, this.clientEntity.userAgent);
+            }
+            if (virtualEntity != null && submissionDifficulty > virtualEntity.bestDifficulty) {
+                await this.clientService.updateBestDifficultyIfHigher(virtualEntity.id, submissionDifficulty);
+                virtualEntity.bestDifficulty = submissionDifficulty;
+            }
+            if (submissionDifficulty > identityBestBefore) {
+                await this.addressSettingsService.updateBestDifficultyIfHigher(minerAddress, submissionDifficulty, this.clientEntity.userAgent);
             }
         }
 
@@ -890,12 +1143,14 @@ export class StratumV1Client {
             timestamp,
             VERSION_ROLLING_MASK,
         );
+        const minerAddress = this.getJobMinerAddress(job);
+        const minerWorker = this.getJobMinerWorker(job);
         const blockHex = updatedJobBlock.toHex(false);
         const blockSubmissionResult = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
         await this.blocksService.save({
             height: jobTemplate.blockData.height,
-            minerAddress: this.clientAuthorization.address,
-            worker: this.clientAuthorization.worker,
+            minerAddress: minerAddress,
+            worker: minerWorker,
             sessionId: this.extraNonceAndSessionId,
             blockData: blockHex,
             blockSubmissionResult,
@@ -914,7 +1169,7 @@ export class StratumV1Client {
         }
 
         await this.notificationService.notifySubscribersBlockFound(
-            this.clientAuthorization.address,
+            minerAddress,
             jobTemplate.blockData.height,
             updatedJobBlock,
             blockSubmissionResult,
@@ -1233,9 +1488,89 @@ export class StratumV1Client {
             ));
     }
 
+    private getCurrentPayoutAddress(): string {
+        return this.currentPayoutAddress ?? this.clientAuthorization.address;
+    }
+
+    /**
+     * The address a submit matched to `job` must be attributed to. It is the
+     * address that job's coinbase actually pays, which can differ from the
+     * connection's authorization after a mining.set_payout switch. In pplns the
+     * coinbase pays the snapshot's payees rather than the submitting miner, so
+     * attribution stays on the authorization there — set_payout is a solo-mode
+     * concept.
+     */
+    private getJobMinerAddress(job: MiningJob): string {
+        return (this.payoutMode === 'solo' ? job.payoutAddress : null)
+            ?? this.clientAuthorization.address;
+    }
+
+    // Serve-time only (jobs are never served before authorization), so the
+    // authorized fallback is always present — no optional chaining that would
+    // let an undefined slip into servedJobWorkers.
+    private getCurrentPayoutWorker(): string {
+        return this.currentPayoutWorker ?? this.clientAuthorization.worker;
+    }
+
+    /**
+     * The worker label a submit matched to `job` must be recorded under: the
+     * label THIS connection served that job under. Jobs are shared between
+     * connections by payout identity, so the label cannot be read off the job
+     * itself — two connections paying the same address routinely carry different
+     * worker names. A job this connection was never served (or one served before
+     * the LRU bound evicted it) falls back to the authorized worker, which is
+     * exactly the pre-set_payout behaviour. Solo-only for the same reason as
+     * getJobMinerAddress: in pplns the coinbase pays the snapshot's payees, so
+     * attribution stays on the authorization.
+     */
+    private getJobMinerWorker(job: MiningJob): string {
+        return (this.payoutMode === 'solo' ? this.servedJobWorkers.get(job.jobId) : null)
+            ?? this.clientAuthorization.worker;
+    }
+
+    private rememberServedJobWorker(jobId: string, worker: string | undefined): void {
+        if (jobId == null || worker == null) {
+            return;
+        }
+        // Re-insert so the map stays in least-recently-served order.
+        this.servedJobWorkers.delete(jobId);
+        this.servedJobWorkers.set(jobId, worker);
+        while (this.servedJobWorkers.size > SERVED_PAYOUT_IDENTITY_MAX_ENTRIES) {
+            const oldest = this.servedJobWorkers.keys().next().value;
+            if (oldest == null) {
+                break;
+            }
+            this.servedJobWorkers.delete(oldest);
+        }
+    }
+
+    private rememberServedPayoutIdentity(payoutIdentity: string | undefined): void {
+        if (payoutIdentity == null) {
+            return;
+        }
+        // Re-insert so the set stays in least-recently-served order.
+        this.servedPayoutIdentities.delete(payoutIdentity);
+        this.servedPayoutIdentities.add(payoutIdentity);
+        while (this.servedPayoutIdentities.size > SERVED_PAYOUT_IDENTITY_MAX_ENTRIES) {
+            const oldest = this.servedPayoutIdentities.values().next().value;
+            if (oldest == null) {
+                break;
+            }
+            this.servedPayoutIdentities.delete(oldest);
+        }
+    }
+
+    private hasServedPayoutIdentity(payoutIdentity: string): boolean {
+        return this.servedPayoutIdentities.has(payoutIdentity);
+    }
+
     private getPayoutIdentity(jobTemplate: IJobTemplate): string | undefined {
         if (this.payoutMode === 'solo') {
-            return `solo\0${this.clientAuthorization.address}`;
+            // Keyed on the address the coinbase pays right now, not on the
+            // authorization: after mining.set_payout the connection must get (and
+            // share) jobs built for the NEW address, never the cached job of the
+            // address it was authorized with.
+            return `solo\0${this.getCurrentPayoutAddress()}`;
         }
         if (jobTemplate.blockData.payoutSnapshotId != null) {
             return `pplns\0${jobTemplate.blockData.payoutSnapshotId}`;
@@ -1251,7 +1586,14 @@ export class StratumV1Client {
         return (templatePayoutMode === 'all' || templatePayoutMode === this.payoutMode)
             && expectedPayoutIdentity != null
             && context.job.ownership?.payoutMode === this.payoutMode
-            && context.job.ownership.payoutIdentity === expectedPayoutIdentity;
+            // The identity the connection is on right now, or any identity it was
+            // previously served — mining.set_payout switches the coinbase mid
+            // session, and a share already in flight for the previous address must
+            // still validate and be attributed to that address, not dropped as
+            // "Job not found". Ownership is still enforced: an identity this
+            // connection was never served is rejected exactly as before.
+            && (context.job.ownership.payoutIdentity === expectedPayoutIdentity
+                || this.hasServedPayoutIdentity(context.job.ownership.payoutIdentity));
     }
 
     private parseUint32Hex(value: string | null | undefined): number | null {
