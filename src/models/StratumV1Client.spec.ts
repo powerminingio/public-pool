@@ -491,7 +491,8 @@ describe('StratumV1Client', () => {
         // No shares for >5 minutes: idle decay retargets to 512/6 → 64. A
         // bursty client (e.g. a proxy serving time-sliced rented hashrate) is
         // quiet between bursts by design; its suggested difficulty must act as
-        // the session floor or repeated decay walks the session to MIN_DIFF.
+        // the session floor or repeated decay walks the session down to the
+        // configured minimum difficulty (STRATUM_MIN_DIFFICULTY).
         jest.setSystemTime(new Date(Date.now() + 6 * 60 * 1000));
         expect((client as any).statistics.getSuggestedDifficulty(512)).toBe(64);
 

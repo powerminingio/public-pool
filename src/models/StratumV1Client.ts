@@ -912,7 +912,8 @@ export class StratumV1Client {
         // A client-suggested difficulty is a floor for the session, not just a
         // starting point. Proxies serving time-sliced/rented hashrate submit in
         // short bursts with long quiet gaps; without the floor the idle decay
-        // walks the session down to MIN_DIFF between bursts, and shares credited
+        // walks the session down to the configured minimum difficulty
+        // (STRATUM_MIN_DIFFICULTY / DEFAULT_MIN_DIFFICULTY) between bursts, and shares credited
         // at dust difficulty make the pool misread the client's hashrate by
         // orders of magnitude. Vardiff may still retarget *above* the suggestion.
         if (this.clientSuggestedDifficulty != null) {
