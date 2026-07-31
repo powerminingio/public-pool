@@ -21,9 +21,14 @@ export class DropLegacyClientStatistics1784837657000 implements MigrationInterfa
         await queryRunner.query(`DROP TABLE IF EXISTS "client_statistics_entity"`);
     }
 
-    public async down(queryRunner: QueryRunner): Promise<void> {
-        // Intentional no-op: the table was an orphaned artifact and its data
-        // (superseded by accepted_share_entity at the schema handover) is not
-        // reconstructable. Nothing in the application requires it to exist.
+    public async down(_queryRunner: QueryRunner): Promise<void> {
+        // Explicitly irreversible: the table was an orphaned artifact and its
+        // data (superseded by accepted_share_entity at the schema handover) is
+        // not reconstructable. Failing loudly beats a revert that reports
+        // success while leaving the table dropped.
+        throw new Error(
+            'DropLegacyClientStatistics is irreversible: the legacy '
+            + 'client_statistics_entity data is not reconstructable.'
+        );
     }
 }
