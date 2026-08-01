@@ -22,6 +22,7 @@ import { PoolSummaryContinuousAggregate1781400000000 } from './ORM/_migrations/P
 import { PoolSummaryRefreshWindow1781401000000 } from './ORM/_migrations/PoolSummaryRefreshWindow1781401000000';
 import { AcceptedShareHighScoreNumericRetention1781402000000 } from './ORM/_migrations/AcceptedShareHighScoreNumericRetention1781402000000';
 import { AcceptedShare10mLookupIndexes1781403000000 } from './ORM/_migrations/AcceptedShare10mLookupIndexes1781403000000';
+import { DropLegacyClientStatistics1784837657000 } from './ORM/_migrations/DropLegacyClientStatistics1784837657000';
 import { UserAgentReportView } from './ORM/_views/user-agent-report/user-agent-report.view';
 import { AcceptedShareEntity } from './ORM/accepted-share/accepted-share.entity';
 import { AddressSettingsEntity } from './ORM/address-settings/address-settings.entity';
@@ -70,6 +71,7 @@ export const databaseMigrations = [
     PoolSummaryRefreshWindow1781401000000,
     AcceptedShareHighScoreNumericRetention1781402000000,
     AcceptedShare10mLookupIndexes1781403000000,
+    DropLegacyClientStatistics1784837657000,
 ];
 
 export function createDatabaseOptions(env: NodeJS.ProcessEnv): TypeOrmModuleOptions & DataSourceOptions {
