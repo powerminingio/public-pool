@@ -15,6 +15,8 @@ jest.mock('../validators/bitcoin-address.validator', () => ({
 }));
 
 // eslint-disable-next-line import/first
+
+import { eRequestMethod } from '../enums/eRequestMethod';
 import { SetPayoutMessage } from './SetPayoutMessage';
 
 describe('SetPayoutMessage', () => {
