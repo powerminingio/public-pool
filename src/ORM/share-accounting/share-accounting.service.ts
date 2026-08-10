@@ -64,6 +64,30 @@ export interface SessionShareSummary {
     bestSubmissionDifficulty: number;
 }
 
+/// One payout identity session with credited work in the trailing day —
+/// derived purely from share history, so it survives connection churn
+/// (a `set_payout` identity's virtual presence row dies with its lane
+/// connection; its shares don't).
+export interface AddressWorkerHistoryRow {
+    /// The session identity. One `client_entity` row = one session, so this
+    /// is what the rows group by — NOT the share's `sessionId`, which for a
+    /// `set_payout` identity is the shared LANE connection's id (the virtual
+    /// row carries its own; PR #18). Grouping on the share's id would print
+    /// one lane's id under every renter it served.
+    clientId: string;
+    clientName: string;
+    /// Best-effort fallback only — callers prefer the client row's own
+    /// sessionId, which is the id the rest of the UI and the drill-down
+    /// routes use.
+    sessionId: string;
+    payoutMode: PayoutMode;
+    latestShareAt: string | null;
+    oldestShareAt: string | null;
+    hashRateLast10Minutes: number;
+    hashRateLastHour: number;
+    hashRateLastDay: number;
+}
+
 export interface ShareRollupBatchResult {
     processed: boolean;
     reason?: 'disabled' | 'locked' | 'no-shares';
@@ -556,6 +580,94 @@ export class ShareAccountingService implements OnModuleInit, OnModuleDestroy {
         });
 
         return summaries;
+    }
+
+    /**
+     * Every payout identity session with credited work for `address` in the
+     * trailing day, straight from the 10-minute rollup — the durable basis of
+     * the address page's workers list. A `set_payout` identity has no
+     * connection of its own (its virtual presence row is soft-deleted with
+     * the lane connection that served it), so a presence-only list reads
+     * "0 workers" for an address whose shares are minutes old; share history
+     * cannot disappear that way. Windowed sums use the same
+     * latestCompletedBucket clock as the summaries so the figures agree with
+     * the address accounting tiles.
+     *
+     * Deliberately NOT gated on `API_ONLY` like [getSessionSummaries]: that
+     * guard ("Avoid client accounting queries in API workers") protects a
+     * `clientId = ANY(...)` scan the rollup carries no index for, whereas
+     * this one is address-scoped and covered by
+     * `IDX_accepted_share_10m_address_bucket` — measured 0.76 ms execution
+     * over a day of buckets on the test pool. Gating it would empty the
+     * workers list on exactly the processes that serve the address page,
+     * which is the bug this method exists to fix.
+     */
+    public async getAddressWorkerHistory(address: string, payoutMode?: PayoutMode): Promise<AddressWorkerHistoryRow[]> {
+        const params: string[] = [address];
+        let modeSql = '';
+        if (payoutMode != null) {
+            params.push(payoutMode);
+            modeSql = `AND "accepted_share_10m"."payoutMode" = $${params.length}`;
+        }
+
+        const rows = await this.acceptedShareRepository.query(`
+            WITH clock AS MATERIALIZED (
+                SELECT
+                    time_bucket(INTERVAL '10 minutes', NOW()) AS "currentBucket"
+            ),
+            latest_bucket AS MATERIALIZED (
+                SELECT "bucket"
+                FROM "accepted_share_10m", clock
+                WHERE "bucket" < clock."currentBucket"
+                ORDER BY "bucket" DESC
+                LIMIT 1
+            ),
+            bounds AS MATERIALIZED (
+                SELECT
+                    "currentBucket",
+                    COALESCE(
+                        (SELECT "bucket" FROM latest_bucket),
+                        "currentBucket" - INTERVAL '10 minutes'
+                    ) AS "latestCompletedBucket"
+                FROM clock
+            ),
+            filtered_rows AS (
+                SELECT "accepted_share_10m".*, bounds."latestCompletedBucket"
+                FROM "accepted_share_10m", bounds
+                WHERE "accepted_share_10m"."address" = $1
+                    ${modeSql}
+                    AND "accepted_share_10m"."bucket" > bounds."latestCompletedBucket" - INTERVAL '1 day'
+                    AND "accepted_share_10m"."bucket" <= bounds."latestCompletedBucket"
+            )
+            SELECT
+                "clientId",
+                "clientName",
+                "payoutMode",
+                MAX("sessionId") AS "sessionId",
+                MAX("bucket") AS "latestShareAt",
+                MIN("bucket") AS "oldestShareAt",
+                COALESCE((SUM("shares") FILTER (WHERE "bucket" = "latestCompletedBucket") * ${HASHES_PER_DIFFICULTY}) / ${ROLLUP_BUCKET_SECONDS}, 0)::float AS "hashRateLast10Minutes",
+                COALESCE((SUM("shares") FILTER (WHERE "bucket" > "latestCompletedBucket" - INTERVAL '1 hour') * ${HASHES_PER_DIFFICULTY}) / 3600, 0)::float AS "hashRateLastHour",
+                COALESCE((SUM("shares") * ${HASHES_PER_DIFFICULTY}) / 86400, 0)::float AS "hashRateLastDay"
+            FROM filtered_rows
+            GROUP BY "clientId", "clientName", "payoutMode"
+        `, params);
+
+        return rows.map(row => ({
+            clientId: row.clientId,
+            clientName: row.clientName,
+            sessionId: row.sessionId,
+            payoutMode: row.payoutMode,
+            latestShareAt: row.latestShareAt == null
+                ? null
+                : new Date(row.latestShareAt).toISOString(),
+            oldestShareAt: row.oldestShareAt == null
+                ? null
+                : new Date(row.oldestShareAt).toISOString(),
+            hashRateLast10Minutes: this.toNumber(row.hashRateLast10Minutes),
+            hashRateLastHour: this.toNumber(row.hashRateLastHour),
+            hashRateLastDay: this.toNumber(row.hashRateLastDay),
+        }));
     }
 
     private async getSummary(filter: AccountingFilter): Promise<ShareAccountingSummary> {

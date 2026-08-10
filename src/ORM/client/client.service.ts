@@ -5,6 +5,10 @@ import { In, Repository } from 'typeorm';
 import { ClientEntity } from './client.entity';
 
 const DEFAULT_CLIENT_ACTIVE_WINDOW_MS = 30 * 60 * 1000;
+/// How far back departed sessions stay available as identity donors for the
+/// address page — the trailing day the share history covers, plus an hour so
+/// a session right at the boundary doesn't lose its metadata.
+const CLIENT_HISTORY_WINDOW_MS = 25 * 60 * 60 * 1000;
 
 @Injectable()
 export class ClientService {
@@ -99,6 +103,30 @@ export class ClientService {
             .where('client.address = :address', { address })
             .andWhere('client.deletedAt IS NULL')
             .andWhere('client.updatedAt > :activeSince', { activeSince })
+            .orderBy('client.updatedAt', 'DESC')
+            .getMany();
+    }
+
+    /**
+     * Like [getByAddress] but including soft-deleted and idle rows — the
+     * identity metadata (own sessionId, best-difficulty ratchet, start time,
+     * user agent) of sessions whose connection is gone.
+     *
+     * `withDeleted()` is load-bearing: `deletedAt` is a `@DeleteDateColumn`
+     * (TrackedEntity), so TypeORM silently excludes soft-deleted rows
+     * otherwise — the query returns live rows only and every departed
+     * identity loses its metadata with no error to show for it.
+     *
+     * Bounded to the same trailing day the share history covers, so this
+     * doesn't depend on the deletion purge having run.
+     */
+    public async getByAddressIncludingDeleted(address: string): Promise<ClientEntity[]> {
+        const since = new Date(Date.now() - CLIENT_HISTORY_WINDOW_MS);
+        return await this.clientRepository
+            .createQueryBuilder('client')
+            .withDeleted()
+            .where('client.address = :address', { address })
+            .andWhere('client.updatedAt > :since', { since })
             .orderBy('client.updatedAt', 'DESC')
             .getMany();
     }
