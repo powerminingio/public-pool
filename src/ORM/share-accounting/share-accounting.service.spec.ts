@@ -307,6 +307,49 @@ describe('ShareAccountingService', () => {
         );
     });
 
+    it('should serve the address worker history in API-only processes', async () => {
+        // The API processes run API_ONLY=true and are exactly the ones serving
+        // the address page. Gating this query like getSessionSummaries (whose
+        // guard protects an unindexed clientId scan) empties the workers list
+        // where it matters — live 2026-08-10 on the test pool: workersCount
+        // dropped to 0 right after a restart cleared the presence rows.
+        process.env.API_ONLY = 'true';
+        const repository = {
+            query: jest.fn().mockResolvedValueOnce([{
+                clientId: 'e0e9b1a2-0000-4000-8000-000000000001',
+                clientName: 'o122',
+                sessionId: 'fb57f41c',
+                payoutMode: 'solo',
+                latestShareAt: new Date('2026-08-10T11:50:00Z'),
+                oldestShareAt: new Date('2026-08-09T12:10:00Z'),
+                hashRateLast10Minutes: '0',
+                hashRateLastHour: '2900000000000',
+                hashRateLastDay: '1200000000000',
+            }]),
+        };
+        const service = new ShareAccountingService(repository as any);
+
+        await expect(service.getAddressWorkerHistory('bc1qapi', 'solo')).resolves.toEqual([
+            expect.objectContaining({
+                clientName: 'o122',
+                sessionId: 'fb57f41c',
+                payoutMode: 'solo',
+                latestShareAt: '2026-08-10T11:50:00.000Z',
+                oldestShareAt: '2026-08-09T12:10:00.000Z',
+                hashRateLastHour: 2900000000000,
+                hashRateLastDay: 1200000000000,
+            }),
+        ]);
+        const [sql, params] = repository.query.mock.calls[0];
+        // Address-scoped + bucket-bounded: served by
+        // IDX_accepted_share_10m_address_bucket (0.76 ms measured), which is
+        // why the API_ONLY guard is not appropriate here.
+        expect(sql).toContain('"accepted_share_10m"."address" = $1');
+        expect(sql).toContain('GROUP BY "clientId", "clientName", "payoutMode"');
+        expect(sql).toContain('INTERVAL \'1 day\'');
+        expect(params).toEqual(['bc1qapi', 'solo']);
+    });
+
     it('should serve API-only pool accounting from rollups when the precomputed pool cache is missing', async () => {
         process.env.API_ONLY = 'true';
         const redis = {
