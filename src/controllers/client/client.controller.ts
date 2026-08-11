@@ -253,7 +253,7 @@ export class ClientController {
             address: string;
             clientName: string;
             sessionId: string;
-            payoutMode: string;
+            payoutMode: PayoutMode;
             userAgent: string | null;
             startTime: Date | string | null;
             lastSeen: Date | string | null;
