@@ -499,6 +499,75 @@ describe('ClientController', () => {
     });
   });
 
+  it('should not let a history bucket floor drag lastSeen behind a live session start', async () => {
+    // The regression shape (live 2026-08-21): a worker reconnects at 12:45,
+    // keeps submitting, but its newest COMPLETED history bucket is 12:40 —
+    // the API then reported lastSeen 12:40 < startTime 12:45 and age-clamped
+    // the instantaneous rate of an actively-submitting worker to 0. All
+    // times relative: the clamp compares against Date.now().
+    const now = Date.now();
+    const updatedAt = new Date(now - 5 * 1000).toISOString(); // just submitted
+    const startTime = new Date(now - 4 * 60 * 1000).toISOString(); // reconnected 4 min ago
+    const bucketFloor = new Date(now - 11 * 60 * 1000).toISOString(); // completed bucket, pre-reconnect
+    clientService.getByAddressIncludingDeleted.mockResolvedValue([
+      {
+        id: 'client-a',
+        address: 'bc1qtest',
+        sessionId: 'sess0001',
+        clientName: 'rig',
+        payoutMode: 'solo',
+        bestDifficulty: 4096,
+        hashRate: 2_000_000_000_000,
+        startTime,
+        updatedAt,
+      },
+    ]);
+    shareAccountingService.getAddressWorkerHistory.mockResolvedValue([
+      {
+        clientId: 'client-a',
+        clientName: 'rig',
+        sessionId: 'sess0001',
+        payoutMode: 'solo',
+        latestShareAt: bucketFloor,
+        oldestShareAt: bucketFloor,
+        hashRateLast10Minutes: 0,
+        hashRateLastHour: 4_000_000_000_000,
+        hashRateLastDay: 3_000_000_000_000,
+      },
+    ]);
+    // The per-session summary is bucketed the same way (MAX("bucket")) and
+    // must not re-introduce the floor at the response layer.
+    shareAccountingService.getSessionSummaries.mockResolvedValue(
+      new Map([
+        ['client-a', {
+          latestShareAt: bucketFloor,
+          hashRateLast10Minutes: 0,
+          bestSubmissionDifficulty: 0,
+        }],
+      ]),
+    );
+    addressSettingsService.getSettings.mockResolvedValue(null);
+    shareAccountingService.getAddressSummary.mockResolvedValue({
+      totalAcceptedShares: 1,
+      totalCreditedDifficulty: 1,
+      bestSubmissionDifficulty: 0,
+    });
+
+    const response = await controller.getClientInfo('bc1qtest');
+    expect(response.workersCount).toBe(1);
+    const worker = response.workers[0];
+    // The bucket label is tightened by the session start (this client's
+    // shares cannot predate it) — never by updatedAt, which keepalives
+    // touch and which must not beat share evidence.
+    expect(worker.lastSeen).toBe(startTime);
+    expect(new Date(worker.lastSeen).getTime()).toBeGreaterThanOrEqual(
+      new Date(worker.startTime).getTime(),
+    );
+    // …so the age clamp sees a share-fresh worker and serves the entity
+    // rate instead of zeroing an actively-submitting session.
+    expect(worker.hashRate).toBe(2_000_000_000_000);
+  });
+
   it('should keep a recently departed session best difficulty on its history row', async () => {
     const recent = new Date(Date.now() - 60 * 1000).toISOString();
     clientService.getByAddressIncludingDeleted.mockResolvedValue([
