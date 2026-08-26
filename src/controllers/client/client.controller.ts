@@ -56,7 +56,13 @@ export class ClientController {
                         Number(worker.bestDifficulty ?? 0),
                         Number(sessionSummary?.bestSubmissionDifficulty ?? 0),
                     );
-                    const lastSeen = sessionSummary?.latestShareAt ?? worker.lastSeen;
+                    // Share evidence (session summary ∪ merged history) wins
+                    // over the keepalive-fed fallback, clamped by startTime —
+                    // both sources are completed-bucket labels (see latestOf).
+                    const shareSeen = this.latestOf(sessionSummary?.latestShareAt, worker.lastShareAt);
+                    const lastSeen = shareSeen != null
+                        ? this.latestOf(shareSeen, worker.startTime)
+                        : worker.lastSeen;
                     // The accounting window normalizes to 0 when empty (never
                     // null), so "no usable rate" is any non-positive value —
                     // only a positive window rate beats the entity fallback.
@@ -184,6 +190,35 @@ export class ClientController {
     }
 
     /**
+     * Later of two nullable timestamps. Share-accounting `latestShareAt`
+     * values are completed 10-minute bucket boundaries (MAX("bucket")):
+     * a share submitted at 12:46 reads as 12:40, so raw bucket labels can
+     * place a worker's last share BEFORE its own session start (live
+     * 2026-08-21: startTime 12:45:07, lastSeen 12:40:00) and feed
+     * `freshHashRate` — whose staleness window is exactly one bucket — a
+     * clock up to two buckets behind a worker that is actively
+     * submitting. A client's shares cannot predate its own startTime, so
+     * taking the later of the two tightens the bucket floor without ever
+     * fabricating recency (both inputs are lower bounds on the true share
+     * time). NOT for updatedAt: that is touched by keepalives and must
+     * never beat share evidence (see the frozen-estimate spec).
+     */
+    private latestOf(
+        a: Date | string | null | undefined,
+        b: Date | string | null | undefined,
+    ): Date | string | null {
+        const at = a == null ? NaN : new Date(a).getTime();
+        const bt = b == null ? NaN : new Date(b).getTime();
+        if (!Number.isFinite(at)) {
+            return Number.isFinite(bt) ? b : null;
+        }
+        if (!Number.isFinite(bt)) {
+            return a;
+        }
+        return at >= bt ? a : b;
+    }
+
+    /**
      * The stored entity hashRate is computed share-event-side (persisted at
      * share arrival), so between shares nothing updates it: an idle session
      * otherwise serves its last in-burst estimate forever (observed live: a
@@ -257,6 +292,8 @@ export class ClientController {
             userAgent: string | null;
             startTime: Date | string | null;
             lastSeen: Date | string | null;
+            /** Newest share evidence (bucket label clamped by startTime); null = no shares in the window. */
+            lastShareAt: Date | string | null;
             hashRate: number;
             hashRate1h: number;
             hashRate24h: number;
@@ -278,7 +315,11 @@ export class ClientController {
                 payoutMode: row.payoutMode,
                 userAgent: client?.userAgent ?? null,
                 startTime: client?.startTime ?? row.oldestShareAt,
-                lastSeen: row.latestShareAt ?? client?.updatedAt ?? null,
+                // Bucket label clamped by the session start (see latestOf):
+                // this row exists because shares landed, so share evidence
+                // is the lastSeen; updatedAt only backstops a null label.
+                lastShareAt: this.latestOf(row.latestShareAt, client?.startTime),
+                lastSeen: this.latestOf(row.latestShareAt, client?.startTime) ?? client?.updatedAt ?? null,
                 hashRate: row.hashRateLast10Minutes,
                 hashRate1h: row.hashRateLastHour,
                 hashRate24h: row.hashRateLastDay,
@@ -304,8 +345,17 @@ export class ClientController {
                 payoutMode: worker.payoutMode,
                 userAgent: worker.userAgent,
                 startTime: worker.startTime,
-                lastSeen: fromHistory?.lastSeen ?? worker.updatedAt,
-                hashRate: fromHistory?.hashRate ?? Number(worker.hashRate ?? 0),
+                lastShareAt: fromHistory?.lastShareAt ?? null,
+                lastSeen: fromHistory?.lastShareAt ?? worker.updatedAt,
+                // Same rule the response layer documents: only a POSITIVE
+                // window rate beats the entity estimate. The trailing-day
+                // rollup lags a full bucket, so a fresh live session reads
+                // 0 there while its entity rate is the honest figure (the
+                // freshHashRate age clamp still zeroes it once share
+                // evidence goes stale).
+                hashRate: fromHistory != null && fromHistory.hashRate > 0
+                    ? fromHistory.hashRate
+                    : Number(worker.hashRate ?? 0),
                 hashRate1h: fromHistory?.hashRate1h ?? 0,
                 hashRate24h: fromHistory?.hashRate24h ?? 0,
                 bestDifficulty: Number(worker.bestDifficulty ?? 0),
