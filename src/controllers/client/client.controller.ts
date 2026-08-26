@@ -190,21 +190,6 @@ export class ClientController {
     }
 
     /**
-     * The stored entity hashRate is computed share-event-side (persisted at
-     * share arrival), so between shares nothing updates it: an idle session
-     * otherwise serves its last in-burst estimate forever (observed live: a
-     * time-sliced proxy upstream reading 2.8 TH/s an hour after its last
-     * share; always-on miners never expose this because shares keep it
-     * fresh). Serve it only while the session's last share is inside the
-     * window it substitutes for; report 0 once older — "Last Seen" already
-     * tells the rest of the story.
-     *
-     * NOTE — to consider for upstream: public-pool master has the same
-     * artifact through a different path (getHashRateForSession divides the
-     * newest stat buckets without checking their age against now), so the
-     * same age clamp applies there.
-     */
-    /**
      * Later of two nullable timestamps. Share-accounting `latestShareAt`
      * values are completed 10-minute bucket boundaries (MAX("bucket")):
      * a share submitted at 12:46 reads as 12:40, so raw bucket labels can
@@ -233,6 +218,21 @@ export class ClientController {
         return at >= bt ? a : b;
     }
 
+    /**
+     * The stored entity hashRate is computed share-event-side (persisted at
+     * share arrival), so between shares nothing updates it: an idle session
+     * otherwise serves its last in-burst estimate forever (observed live: a
+     * time-sliced proxy upstream reading 2.8 TH/s an hour after its last
+     * share; always-on miners never expose this because shares keep it
+     * fresh). Serve it only while the session's last share is inside the
+     * window it substitutes for; report 0 once older — "Last Seen" already
+     * tells the rest of the story.
+     *
+     * NOTE — to consider for upstream: public-pool master has the same
+     * artifact through a different path (getHashRateForSession divides the
+     * newest stat buckets without checking their age against now), so the
+     * same age clamp applies there.
+     */
     private freshHashRate(hashRate: unknown, lastSeen: unknown): number {
         const lastSeenMs = lastSeen == null ? NaN : new Date(lastSeen as string | number | Date).getTime();
         if (!Number.isFinite(lastSeenMs) || Date.now() - lastSeenMs > STALE_HASHRATE_WINDOW_MS) {
