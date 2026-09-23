@@ -1,5 +1,6 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Interval } from '@nestjs/schedule';
 import * as crypto from 'crypto';
 import { Server, Socket } from 'net';
 import { Subscription } from 'rxjs';
@@ -352,6 +353,20 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
         }
 
         this.serverKeypair = await generateServerKeypair();
+        this.regenerateNoiseCertificate();
+    }
+
+    @Interval(12 * 60 * 60 * 1000)
+    private rotateNoiseCertificate(): void {
+        if (this.noiseConfig == null) {
+            return;
+        }
+
+        this.regenerateNoiseCertificate();
+        console.log('SV2 Noise certificate rotated');
+    }
+
+    private regenerateNoiseCertificate(): void {
         const now = Math.floor(Date.now() / 1000);
         this.noiseConfig = {
             staticKeypair: this.serverKeypair,
