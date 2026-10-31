@@ -66,7 +66,17 @@ export class ClientController {
                     // The accounting window normalizes to 0 when empty (never
                     // null), so "no usable rate" is any non-positive value —
                     // only a positive window rate beats the entity fallback.
+                    // Two window sources: the per-session summary (empty on
+                    // API_ONLY processes, which serve this page) and the
+                    // address-scoped history merge. Neither is age-clamped:
+                    // each reads the latest COMPLETED bucket, so it is 0 by
+                    // construction once a session stops submitting, while its
+                    // lastSeen (that bucket's label) is always 10–20 min old —
+                    // clamping it zeroed every mining session (prod
+                    // 2026-10-31). Only the entity estimate can freeze, so
+                    // only it goes through freshHashRate.
                     const accountingHashRate = Number(sessionSummary?.hashRateLast10Minutes ?? 0);
+                    const windowHashRate = Number(worker.windowHashRate ?? 0);
                     return {
                         sessionId: worker.sessionId,
                         name: worker.clientName,
@@ -74,7 +84,9 @@ export class ClientController {
                         bestDifficulty: bestDifficulty.toFixed(2),
                         hashRate: Number.isFinite(accountingHashRate) && accountingHashRate > 0
                             ? accountingHashRate
-                            : this.freshHashRate(worker.hashRate, lastSeen),
+                            : Number.isFinite(windowHashRate) && windowHashRate > 0
+                                ? windowHashRate
+                                : this.freshHashRate(worker.hashRate, lastSeen),
                         hashRate1h: worker.hashRate1h,
                         hashRate24h: worker.hashRate24h,
                         live: worker.live,
@@ -295,6 +307,8 @@ export class ClientController {
             /** Newest share evidence (bucket label clamped by startTime); null = no shares in the window. */
             lastShareAt: Date | string | null;
             hashRate: number;
+            /** The rollup's latest-completed-bucket rate; 0 = no window evidence. */
+            windowHashRate: number;
             hashRate1h: number;
             hashRate24h: number;
             bestDifficulty: number;
@@ -321,6 +335,7 @@ export class ClientController {
                 lastShareAt: this.latestOf(row.latestShareAt, client?.startTime),
                 lastSeen: this.latestOf(row.latestShareAt, client?.startTime) ?? client?.updatedAt ?? null,
                 hashRate: row.hashRateLast10Minutes,
+                windowHashRate: row.hashRateLast10Minutes,
                 hashRate1h: row.hashRateLastHour,
                 hashRate24h: row.hashRateLastDay,
                 bestDifficulty: Number(client?.bestDifficulty ?? 0),
@@ -356,6 +371,7 @@ export class ClientController {
                 hashRate: fromHistory != null && fromHistory.hashRate > 0
                     ? fromHistory.hashRate
                     : Number(worker.hashRate ?? 0),
+                windowHashRate: fromHistory?.windowHashRate ?? 0,
                 hashRate1h: fromHistory?.hashRate1h ?? 0,
                 hashRate24h: fromHistory?.hashRate24h ?? 0,
                 bestDifficulty: Number(worker.bestDifficulty ?? 0),
