@@ -615,6 +615,49 @@ describe('ClientController', () => {
     expect(response.workers[0].hashRate).toBe(10_790_000_000_000);
   });
 
+  it('should expire a window rate whose bucket stopped advancing', async () => {
+    // The window is anchored to the newest stored pool-wide bucket, so a
+    // stalled rollup refresh (2026-07-23: frozen ~9 h) would keep serving the
+    // last positive rate. Past three buckets the rate is no longer current.
+    const now = Date.now();
+    const staleLabel = new Date(now - 45 * 60 * 1000).toISOString();
+    clientService.getByAddressIncludingDeleted.mockResolvedValue([
+      {
+        id: 'client-a',
+        address: 'bc1qtest',
+        sessionId: 'sess0001',
+        clientName: 'rig',
+        payoutMode: 'solo',
+        bestDifficulty: 4096,
+        hashRate: 0,
+        startTime: new Date(now - 2 * 60 * 60 * 1000).toISOString(),
+        updatedAt: new Date(now - 5 * 1000).toISOString(),
+      },
+    ]);
+    shareAccountingService.getAddressWorkerHistory.mockResolvedValue([
+      {
+        clientId: 'client-a',
+        clientName: 'rig',
+        sessionId: 'sess0001',
+        payoutMode: 'solo',
+        latestShareAt: staleLabel,
+        oldestShareAt: staleLabel,
+        hashRateLast10Minutes: 5_000_000_000_000,
+        hashRateLastHour: 5_000_000_000_000,
+        hashRateLastDay: 5_000_000_000_000,
+      },
+    ]);
+    addressSettingsService.getSettings.mockResolvedValue(null);
+    shareAccountingService.getAddressSummary.mockResolvedValue({
+      totalAcceptedShares: 1,
+      totalCreditedDifficulty: 1,
+      bestSubmissionDifficulty: 0,
+    });
+
+    const response = await controller.getClientInfo('bc1qtest');
+    expect(response.workers[0].hashRate).toBe(0);
+  });
+
   it('should still zero a frozen entity estimate when the window holds no shares', async () => {
     // The clamp's job is unchanged: a session whose latest completed bucket
     // is empty and whose share evidence is old must not serve its frozen
