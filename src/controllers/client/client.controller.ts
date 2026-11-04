@@ -395,10 +395,7 @@ export class ClientController {
                 hashRate: fromHistory != null && fromHistory.hashRate > 0
                     ? fromHistory.hashRate
                     : Number(worker.hashRate ?? 0),
-<<<<<<< HEAD
                 windowHashRate: fromHistory?.windowHashRate ?? 0,
-=======
->>>>>>> origin/timescaledb-pm-2
                 hashRate1h: fromHistory?.hashRate1h ?? 0,
                 hashRate24h: fromHistory?.hashRate24h ?? 0,
                 bestDifficulty: Number(worker.bestDifficulty ?? 0),

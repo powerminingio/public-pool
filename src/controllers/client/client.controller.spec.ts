@@ -568,7 +568,6 @@ describe('ClientController', () => {
     expect(worker.hashRate).toBe(2_000_000_000_000);
   });
 
-<<<<<<< HEAD
   it('should serve the completed-bucket window rate of a long-running session without age-clamping it', async () => {
     // Prod 2026-10-31: every mining session on an address read hashRate 0.
     // The API process runs API_ONLY (per-session summaries empty), so the
@@ -702,8 +701,6 @@ describe('ClientController', () => {
     expect(response.workers[0].hashRate).toBe(0);
   });
 
-=======
->>>>>>> origin/timescaledb-pm-2
   it('should keep a recently departed session best difficulty on its history row', async () => {
     const recent = new Date(Date.now() - 60 * 1000).toISOString();
     clientService.getByAddressIncludingDeleted.mockResolvedValue([
